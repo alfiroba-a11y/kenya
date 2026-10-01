@@ -11,14 +11,14 @@ const { WORKSPACES, LEVELS, getQuestions } = require('./workspaces');
 
 const app = express();
 app.set('trust proxy', 1);
-app.use(helmet({ contentSecurityPolicy: { directives: { ...helmet.contentSecurityPolicy.getDefaultDirectives(), "script-src": ["'self'", "https://pay.hashback.co.ke"], "style-src": ["'self'", "https://fonts.googleapis.com"], "font-src": ["'self'", "https://fonts.gstatic.com", "data:"], "frame-src": ["'self'", "https://pay.hashback.co.ke"], "connect-src": ["'self'", "https://api.hashback.co.ke"] } } }));
+app.use(helmet({ contentSecurityPolicy: { directives: { ...helmet.contentSecurityPolicy.getDefaultDirectives(), "style-src": ["'self'", "https://fonts.googleapis.com"], "font-src": ["'self'", "https://fonts.gstatic.com", "data:"], "connect-src": ["'self'", "https://api.hashback.co.ke"] } } }));
 app.use('/api/payments/hashpay/webhook', express.raw({ type: 'application/json', limit: '32kb' }));
 app.use(express.json({ limit: '20kb' }));
 app.use(express.static('public'));
 
 const userSchema = new mongoose.Schema({ name: { type: String, required: true, trim: true, maxlength: 80 }, username: { type: String, unique: true, sparse: true, lowercase: true, trim: true }, email: { type: String, required: true, unique: true, lowercase: true, trim: true }, phone: { type: String, required: true }, password: { type: String, required: true }, walletBalance: { type: Number, default: 0 }, reservedBalance: { type: Number, default: 0 }, createdAt: { type: Date, default: Date.now } });
 const User = mongoose.model('User', userSchema);
-const depositSchema = new mongoose.Schema({ userId: { type: mongoose.Schema.Types.ObjectId, required: true, index: true }, reference: { type: String, required: true, unique: true }, amount: { type: Number, required: true }, status: { type: String, enum: ['pending', 'paid', 'failed'], default: 'pending' }, receipt: { type: String, unique: true, sparse: true }, checkoutId: String, createdAt: { type: Date, default: Date.now } });
+const depositSchema = new mongoose.Schema({ userId: { type: mongoose.Schema.Types.ObjectId, required: true, index: true }, reference: { type: String, required: true, unique: true }, amount: { type: Number, required: true }, phone: { type: String, required: true }, status: { type: String, enum: ['pending', 'paid', 'failed'], default: 'pending' }, receipt: { type: String, unique: true, sparse: true }, checkoutId: String, createdAt: { type: Date, default: Date.now } });
 const Deposit = mongoose.model('Deposit', depositSchema);
 const withdrawalSchema = new mongoose.Schema({ userId: { type: mongoose.Schema.Types.ObjectId, required: true, index: true }, amount: { type: Number, required: true }, phone: { type: String, required: true }, status: { type: String, enum: ['pending', 'processing', 'paid', 'failed'], default: 'pending' }, payoutId: String, createdAt: { type: Date, default: Date.now } });
 const Withdrawal = mongoose.model('Withdrawal', withdrawalSchema);
@@ -137,14 +137,29 @@ app.get('/api/public/withdrawals/recent', async (_req,res) => {
 });
 app.post('/api/payments/deposit', auth, async (req, res) => {
   const amount = Number(req.body?.amount);
+  const phone = normalizePhone(req.body?.phone);
   if (!Number.isSafeInteger(amount) || amount < 650 || amount > 100000) return res.status(400).json({ error: 'Deposits must be between KES 650 and KES 100,000.' });
-  if (!process.env.HASHPAY_ACCOUNT_ID || !process.env.HASHPAY_WEBHOOK_SECRET) return res.status(503).json({ error: 'Payments are not configured yet. Please try again later.' });
+  if (!phoneOk(phone)) return res.status(400).json({ error: 'Enter a valid Kenyan M-Pesa number.' });
+  if (!process.env.HASHPAY_ACCOUNT_ID || !process.env.HASHPAY_API_KEY || !process.env.HASHPAY_WEBHOOK_SECRET) return res.status(503).json({ error: 'HashPay STK Push is not fully configured yet.' });
   const reference = `KK-${crypto.randomUUID()}`;
-  const deposit = await Deposit.create({ userId: req.user.id, amount, reference });
-  res.status(201).json({ reference: deposit.reference, amount: deposit.amount, account: process.env.HASHPAY_ACCOUNT_ID, status: deposit.status, message: 'Complete the M-Pesa prompt. Your balance updates after HashPay verifies payment.' });
+  const deposit = await Deposit.create({ userId: req.user.id, amount, phone, reference });
+  let response, result;
+  try {
+    response = await fetch('https://api.hashback.co.ke/initiatestk', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ api_key: process.env.HASHPAY_API_KEY, account_id: process.env.HASHPAY_ACCOUNT_ID, amount: String(amount), msisdn: phone, reference }), signal: AbortSignal.timeout(20000) });
+    result = await response.json();
+  } catch (e) {
+    // The request may have reached HashPay even if the response timed out; leave it pending to avoid sending a duplicate prompt.
+    return res.status(202).json({ reference, status: 'pending', message: 'We could not confirm the prompt response. Check your phone and wallet before trying again.' });
+  }
+  if (!response.ok || result.success !== true || !result.checkout_id) {
+    await Deposit.updateOne({ _id: deposit._id, status: 'pending' }, { $set: { status: 'failed' } });
+    return res.status(502).json({ error: result.message || result.ResponseDescription || 'HashPay could not send the M-Pesa prompt.' });
+  }
+  await Deposit.updateOne({ _id: deposit._id, status: 'pending' }, { $set: { checkoutId: String(result.checkout_id) } });
+  res.status(201).json({ reference, checkoutId: result.checkout_id, amount, phone, status: 'pending', message: 'M-Pesa prompt sent. Enter your PIN on your phone; your wallet updates after payment confirmation.' });
 });
 app.get('/api/payments/deposits/:reference', auth, async (req,res) => {
-  const deposit=await Deposit.findOne({reference:req.params.reference,userId:req.user.id}).select('reference amount status receipt createdAt');
+  const deposit=await Deposit.findOne({reference:req.params.reference,userId:req.user.id}).select('reference amount status receipt checkoutId createdAt');
   if(!deposit)return res.status(404).json({error:'Deposit order not found.'});
   res.json(deposit);
 });
@@ -165,12 +180,16 @@ app.post('/api/payments/hashpay/webhook', express.raw({ type: 'application/json'
   const session = await mongoose.startSession();
   try {
     await session.withTransaction(async () => {
-      const claimed = await Deposit.findOneAndUpdate({ reference, status: 'pending', amount }, { $set: { status: 'paid', receipt: String(event.TransactionID), checkoutId: String(event.CheckoutRequestID || '') } }, { new: true, session });
+      const deposit = await Deposit.findOne({ reference, status: 'pending', amount }).session(session);
+      if (!deposit) return;
+      if (event.Msisdn && normalizePhone(event.Msisdn) !== normalizePhone(deposit.phone)) throw Object.assign(new Error('Phone mismatch'), { status: 400 });
+      const claimed = await Deposit.findOneAndUpdate({ _id: deposit._id, status: 'pending', amount }, { $set: { status: 'paid', receipt: String(event.TransactionID), checkoutId: String(event.CheckoutRequestID || deposit.checkoutId || '') } }, { new: true, session });
       if (!claimed) return;
       await User.updateOne({ _id: claimed.userId }, { $inc: { walletBalance: amount } }, { session });
       await Entry.create([{ userId: claimed.userId, type: 'deposit', amount, reference: `dep:${reference}`, note: `M-Pesa deposit · ${event.TransactionID}` }], { session });
     });
-  } finally { await session.endSession(); }
+  } catch(e) { if(e.status===400)return res.status(400).send(e.message); throw e; }
+  finally { await session.endSession(); }
   res.sendStatus(200);
 });
 app.post('/api/wallet/withdrawals', auth, async (req, res) => {

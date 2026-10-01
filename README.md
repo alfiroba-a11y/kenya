@@ -6,13 +6,13 @@ Kazi Kenya is a Kenya-focused online-work skills hub with 19 workspaces. Each ha
 1. Push this folder to GitHub and create a Render **Web Service** from the repository. Runtime: Node. Build command: `npm install`; start command: `npm start`.
 2. Create a MongoDB Atlas free M0 cluster (Render does not provide a free hosted Mongo database). Allow the Render service outbound access in Atlas network access, create a database user, and set `MONGODB_URI` in Render to the Atlas connection string.
 3. Add the environment variables from `.env.example` in Render. Generate unique long random values for `JWT_SECRET` and `ADMIN_TOKEN`. Keep API keys and webhook secrets private.
-4. In HashPay, configure the webhook URL as `https://YOUR-RENDER-HOST/api/payments/hashpay/webhook`, then set its signing secret as `HASHPAY_WEBHOOK_SECRET`. Set the payment channel's public account ID as `HASHPAY_ACCOUNT_ID`.
+4. In HashPay, configure the webhook URL as `https://YOUR-RENDER-HOST/api/payments/hashpay/webhook`, then set its signing secret as `HASHPAY_WEBHOOK_SECRET`. Set the payment channel's public account ID as `HASHPAY_ACCOUNT_ID` and its server API key as `HASHPAY_API_KEY`.
 5. Ensure the HashPay account is approved and funded for B2C payouts before enabling withdrawals. B2C credentials are server-only.
 
 MongoDB Atlas is used because Render's free web service does not bundle a persistent SQL database. The application refuses to start without a valid MongoDB connection.
 
 ## Money flow
-- Deposit initiation creates a pending order on the server, fixes its expected amount and unique reference, then opens HashPay's hosted M-Pesa payment UI. A browser success message never credits funds. Only a valid HMAC-SHA256 signed HashPay webhook credits the exact matching order, once.
+- Deposit initiation asks for the user's M-Pesa number in the Kazi Kenya wallet, then the server calls HashPay's STK Push endpoint to send the prompt directly to that phone. The deposit remains pending until a valid HMAC-SHA256 signed HashPay webhook confirms the exact amount, phone, account, and reference; only then is the wallet credited once. The hosted checkout is not opened in the site.
 - Withdrawals (KES 1,250 minimum) are enabled once a user's available balance reaches KES 1,250. Requests are held as pending against the user's wallet and require an admin review. An authorized admin triggers the HashPay B2C payout; duplicate payouts are prevented with an atomic status transition. Configure `ADMIN_TOKEN` securely and expose its use only to a trusted operator.
 - Profile settings allow name/username changes and password changes with current-password verification. Withdrawal requests can specify their M-Pesa destination.
 - Workspace quizzes save learning progress but do not award money. The KES 1,250 shown while logged out is labeled demo preview and is not a real balance.
@@ -24,7 +24,7 @@ MongoDB Atlas is used because Render's free web service does not bundle a persis
 - `GET /api/workspaces/:slug/levels/:level/questions`, `POST /api/workspaces/:slug/levels/:level/complete`
 - `GET /api/me`, `PATCH /api/profile`, `PATCH /api/profile/password`
 - `GET /api/wallet`, `GET /api/wallet/transactions`
-- `POST /api/payments/deposit` `{ "amount": 650 }` (minimum KES 650)
+- `POST /api/payments/deposit` `{ "amount": 650, "phone": "0712345678" }` (minimum KES 650; starts an M-Pesa STK prompt)
 - `POST /api/wallet/withdrawals` `{ "amount": 1250, "phone": "0712345678" }` (minimum KES 1,250)
 - `POST /api/payments/hashpay/webhook` (HashPay signed callback)
 - `GET /api/health`
