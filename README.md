@@ -14,6 +14,7 @@ MongoDB Atlas is used because Render's free web service does not bundle a persis
 ## Money flow
 - Deposit initiation creates a pending order on the server, fixes its expected amount and unique reference, then opens HashPay's hosted M-Pesa payment UI. A browser success message never credits funds. Only a valid HMAC-SHA256 signed HashPay webhook credits the exact matching order, once.
 - Withdrawals (KES 1,250 minimum) are enabled once a user's available balance reaches KES 1,250. Requests are held as pending against the user's wallet and require an admin review. An authorized admin triggers the HashPay B2C payout; duplicate payouts are prevented with an atomic status transition. Configure `ADMIN_TOKEN` securely and expose its use only to a trusted operator.
+- Profile settings allow name/username changes and password changes with current-password verification. Withdrawal requests can specify their M-Pesa destination.
 - Workspace quizzes save learning progress but do not award money. The KES 1,250 shown while logged out is labeled demo preview and is not a real balance.
 - New accounts start at KES 0. Only verified deposits and operator-credited client-paid work affect the wallet. A level completion is not a promise of a job or earnings.
 
@@ -21,7 +22,8 @@ MongoDB Atlas is used because Render's free web service does not bundle a persis
 - `POST /api/auth/register`, `POST /api/auth/login`
 - `GET /api/workspaces`, `GET /api/workspaces/progress`
 - `GET /api/workspaces/:slug/levels/:level/questions`, `POST /api/workspaces/:slug/levels/:level/complete`
-- `GET /api/me`, `GET /api/wallet`, `GET /api/wallet/transactions`
+- `GET /api/me`, `PATCH /api/profile`, `PATCH /api/profile/password`
+- `GET /api/wallet`, `GET /api/wallet/transactions`
 - `POST /api/payments/deposit` `{ "amount": 650 }` (minimum KES 650)
 - `POST /api/wallet/withdrawals` `{ "amount": 1250, "phone": "0712345678" }` (minimum KES 1,250)
 - `POST /api/payments/hashpay/webhook` (HashPay signed callback)

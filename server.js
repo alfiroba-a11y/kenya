@@ -16,7 +16,7 @@ app.use('/api/payments/hashpay/webhook', express.raw({ type: 'application/json',
 app.use(express.json({ limit: '20kb' }));
 app.use(express.static('public'));
 
-const userSchema = new mongoose.Schema({ name: { type: String, required: true, trim: true, maxlength: 80 }, email: { type: String, required: true, unique: true, lowercase: true, trim: true }, phone: { type: String, required: true }, password: { type: String, required: true }, walletBalance: { type: Number, default: 0 }, reservedBalance: { type: Number, default: 0 }, createdAt: { type: Date, default: Date.now } });
+const userSchema = new mongoose.Schema({ name: { type: String, required: true, trim: true, maxlength: 80 }, username: { type: String, unique: true, sparse: true, lowercase: true, trim: true }, email: { type: String, required: true, unique: true, lowercase: true, trim: true }, phone: { type: String, required: true }, password: { type: String, required: true }, walletBalance: { type: Number, default: 0 }, reservedBalance: { type: Number, default: 0 }, createdAt: { type: Date, default: Date.now } });
 const User = mongoose.model('User', userSchema);
 const depositSchema = new mongoose.Schema({ userId: { type: mongoose.Schema.Types.ObjectId, required: true, index: true }, reference: { type: String, required: true, unique: true }, amount: { type: Number, required: true }, status: { type: String, enum: ['pending', 'paid', 'failed'], default: 'pending' }, receipt: { type: String, unique: true, sparse: true }, checkoutId: String, createdAt: { type: Date, default: Date.now } });
 const Deposit = mongoose.model('Deposit', depositSchema);
@@ -38,13 +38,15 @@ function auth(req, res, next) {
 }
 const emailOk = v => typeof v === 'string' && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v) && v.length <= 200;
 const phoneOk = v => /^(?:\+?254|0)(?:7|1)\d{8}$/.test(String(v || '').replace(/[\s-]/g, ''));
+const usernameOk = v => typeof v === 'string' && /^[a-zA-Z0-9_]{3,20}$/.test(v);
 
 app.get('/api/health', (_req, res) => res.json({ ok: mongoose.connection.readyState === 1, database: 'mongodb' }));
 app.post('/api/auth/register', authLimit, async (req, res) => {
   const { name, email, phone, password } = req.body || {};
   if (typeof name !== 'string' || name.trim().length < 2 || name.length > 80 || !emailOk(email) || !phoneOk(phone) || typeof password !== 'string' || password.length < 10) return res.status(400).json({ error: 'Enter your name, a valid email, Kenyan M-Pesa number, and password of at least 10 characters.' });
   try {
-    const user = await User.create({ name: name.trim(), email, phone: normalizePhone(phone), password: await bcrypt.hash(password, 12) });
+    const usernameBase = name.toLowerCase().replace(/[^a-z0-9_]/g, '').slice(0, 14) || 'kaziuser';
+    const user = await User.create({ name: name.trim(), username: `${usernameBase}_${crypto.randomInt(1000,9999)}`, email, phone: normalizePhone(phone), password: await bcrypt.hash(password, 12) });
     res.status(201).json(issueToken(user));
   } catch (e) { if (e.code === 11000) return res.status(409).json({ error: 'An account already uses this email.' }); throw e; }
 });
@@ -54,8 +56,20 @@ app.post('/api/auth/login', authLimit, async (req, res) => {
   if (!user || !(await bcrypt.compare(String(password || ''), user.password))) return res.status(401).json({ error: 'Email or password is incorrect.' });
   res.json(issueToken(user));
 });
-function issueToken(user) { return { token: jwt.sign({ id: user.id, name: user.name, email: user.email }, process.env.JWT_SECRET, { expiresIn: '7d' }), user: { name: user.name, email: user.email } }; }
-app.get('/api/me', auth, async (req, res) => { const user = await User.findById(req.user.id).select('name email phone'); if (!user) return res.status(404).json({ error: 'Account not found.' }); res.json({ user }); });
+function issueToken(user) { return { token: jwt.sign({ id: user.id, name: user.name, email: user.email }, process.env.JWT_SECRET, { expiresIn: '7d' }), user: { name: user.name, username: user.username, email: user.email } }; }
+app.get('/api/me', auth, async (req, res) => { const user = await User.findById(req.user.id).select('name username email phone'); if (!user) return res.status(404).json({ error: 'Account not found.' }); res.json({ user }); });
+app.patch('/api/profile', auth, async (req,res) => {
+  const name=String(req.body?.name||'').trim(),username=String(req.body?.username||'').trim().toLowerCase();
+  if(name.length<2||name.length>80||!usernameOk(username))return res.status(400).json({error:'Enter a name (2–80 characters) and username (3–20 letters, numbers, or underscores).'});
+  try{const user=await User.findByIdAndUpdate(req.user.id,{$set:{name,username}},{new:true,runValidators:true}).select('name username email phone');res.json({user})}
+  catch(e){if(e.code===11000)return res.status(409).json({error:'That username is already in use.'});throw e}
+});
+app.patch('/api/profile/password', auth, authLimit, async (req,res) => {
+  const current=String(req.body?.currentPassword||''),next=String(req.body?.newPassword||'');
+  if(next.length<10||next.length>128)return res.status(400).json({error:'New password must be 10–128 characters.'});
+  const user=await User.findById(req.user.id);if(!user||!(await bcrypt.compare(current,user.password)))return res.status(400).json({error:'Current password is incorrect.'});
+  user.password=await bcrypt.hash(next,12);await user.save();res.json({changed:true,message:'Password updated.'});
+});
 
 app.get('/api/workspaces', async (_req, res) => res.json({ workspaces: WORKSPACES, levels: LEVELS }));
 app.get('/api/workspaces/progress', auth, async (req, res) => {
@@ -164,7 +178,7 @@ app.post('/api/wallet/withdrawals', auth, async (req, res) => {
   const phone = normalizePhone(req.body?.phone || profile?.phone);
   if (!Number.isSafeInteger(amount) || amount < 1250 || amount > 100000) return res.status(400).json({ error: 'Withdrawals must be between KES 1,250 and KES 100,000.' });
   if (!phoneOk(phone)) return res.status(400).json({ error: 'Enter a valid Kenyan mobile number.' });
-  if (!profile || phone !== profile.phone) return res.status(400).json({ error: 'Withdrawals can only go to the M-Pesa number registered on your account.' });
+  if (!profile) return res.status(404).json({ error: 'Account not found.' });
   const session = await mongoose.startSession();
   let withdrawal;
   try {
