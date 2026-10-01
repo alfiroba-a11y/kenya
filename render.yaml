@@ -15,6 +15,8 @@ services:
         value: Kiokok614@gmail.com
       - key: ADMIN_PASSWORD
         sync: false
+      - key: ADMIN_PATH
+        sync: false
       - key: HASHPAY_ACCOUNT_ID
         sync: false
       - key: HASHPAY_API_KEY

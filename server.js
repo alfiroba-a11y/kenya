@@ -16,22 +16,29 @@ app.use('/api/payments/hashpay/webhook', express.raw({ type: 'application/json',
 app.use(express.json({ limit: '20kb' }));
 app.use(express.static('public'));
 
-const userSchema = new mongoose.Schema({ name: { type: String, required: true, trim: true, maxlength: 80 }, username: { type: String, unique: true, sparse: true, lowercase: true, trim: true }, email: { type: String, required: true, unique: true, lowercase: true, trim: true }, phone: { type: String, required: true }, password: { type: String, required: true }, walletBalance: { type: Number, default: 0 }, reservedBalance: { type: Number, default: 0 }, createdAt: { type: Date, default: Date.now } });
+const userSchema = new mongoose.Schema({ name: { type: String, required: true, trim: true, maxlength: 80 }, username: { type: String, unique: true, sparse: true, lowercase: true, trim: true }, email: { type: String, required: true, unique: true, lowercase: true, trim: true }, phone: { type: String, required: true }, password: { type: String, required: true }, walletBalance: { type: Number, default: 0 }, reservedBalance: { type: Number, default: 0 }, skillPoints: { type: Number, default: 0 }, createdAt: { type: Date, default: Date.now } });
 const User = mongoose.model('User', userSchema);
 const depositSchema = new mongoose.Schema({ userId: { type: mongoose.Schema.Types.ObjectId, required: true, index: true }, reference: { type: String, required: true, unique: true }, amount: { type: Number, required: true }, phone: { type: String, required: true }, status: { type: String, enum: ['pending', 'paid', 'failed'], default: 'pending' }, receipt: { type: String, unique: true, sparse: true }, checkoutId: String, createdAt: { type: Date, default: Date.now } });
 const Deposit = mongoose.model('Deposit', depositSchema);
 const withdrawalSchema = new mongoose.Schema({ userId: { type: mongoose.Schema.Types.ObjectId, required: true, index: true }, amount: { type: Number, required: true }, phone: { type: String, required: true }, status: { type: String, enum: ['pending', 'processing', 'paid', 'failed'], default: 'pending' }, payoutId: String, createdAt: { type: Date, default: Date.now } });
 const Withdrawal = mongoose.model('Withdrawal', withdrawalSchema);
-const entrySchema = new mongoose.Schema({ userId: { type: mongoose.Schema.Types.ObjectId, required: true, index: true }, type: { type: String, enum: ['deposit', 'earning', 'withdrawal'], required: true }, amount: { type: Number, required: true }, reference: { type: String, required: true, unique: true }, note: String, createdAt: { type: Date, default: Date.now } });
+const entrySchema = new mongoose.Schema({ userId: { type: mongoose.Schema.Types.ObjectId, required: true, index: true }, type: { type: String, enum: ['deposit', 'earning', 'withdrawal', 'adjustment'], required: true }, amount: { type: Number, required: true }, direction: { type: String, enum: ['credit', 'debit'] }, reference: { type: String, required: true, unique: true }, note: String, createdAt: { type: Date, default: Date.now } });
 const Entry = mongoose.model('Entry', entrySchema);
-const progressSchema = new mongoose.Schema({ userId: { type: mongoose.Schema.Types.ObjectId, required: true, index: true }, workspace: { type: String, required: true }, levels: { type: [{ level: Number, completed: Boolean, score: Number, completedAt: Date }], default: [] }, updatedAt: { type: Date, default: Date.now } });
+const progressSchema = new mongoose.Schema({ userId: { type: mongoose.Schema.Types.ObjectId, required: true, index: true }, workspace: { type: String, required: true }, levels: { type: [{ level: Number, completed: Boolean, score: Number, points: Number, completedAt: Date }], default: [] }, updatedAt: { type: Date, default: Date.now } });
 progressSchema.index({ userId: 1, workspace: 1 }, { unique: true });
 const Progress = mongoose.model('Progress', progressSchema);
 const attemptSchema = new mongoose.Schema({ userId: { type: mongoose.Schema.Types.ObjectId, required: true, index: true }, workspace: { type: String, required: true }, level: { type: Number, required: true }, answers: [{ questionId: String, correctChoice: Number }], usedAt: Date, expiresAt: { type: Date, expires: 0 } });
 const QuestionAttempt = mongoose.model('QuestionAttempt', attemptSchema);
+const quizSettingsSchema = new mongoose.Schema({ key: { type: String, unique: true, default: 'main' }, skillPointsPerCorrect: { type: Number, default: 20 }, difficultyMultipliers: { type: [Number], default: [1, 1.25, 1.5, 1.75, 2, 2.5] }, updatedAt: { type: Date, default: Date.now } });
+const QuizSettings = mongoose.model('QuizSettings', quizSettingsSchema);
 
 const authLimit = rateLimit({ windowMs: 15 * 60 * 1000, limit: 20, standardHeaders: true, legacyHeaders: false });
 const configuredAdminEmail = () => String(process.env.ADMIN_EMAIL || 'Kiokok614@gmail.com').trim().toLowerCase();
+const adminPortalPath = () => {
+  const path = String(process.env.ADMIN_PATH || '');
+  if (!/^\/kz-control-[a-z0-9-]{12,80}$/i.test(path)) throw new Error('ADMIN_PATH must be set to a private /kz-control-… path.');
+  return path;
+};
 function adminAuthorized(req) {
   try {
     const token = (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
@@ -90,6 +97,13 @@ app.patch('/api/profile/password', auth, authLimit, async (req,res) => {
 });
 
 app.get('/api/workspaces', async (_req, res) => res.json({ workspaces: WORKSPACES, levels: LEVELS }));
+const DEFAULT_QUIZ_SETTINGS = { skillPointsPerCorrect: 20, difficultyMultipliers: [1, 1.25, 1.5, 1.75, 2, 2.5] };
+async function getQuizSettings(session) {
+  let query = QuizSettings.findOne({ key: 'main' });
+  if (session) query = query.session(session);
+  const settings = await query.lean();
+  return settings || DEFAULT_QUIZ_SETTINGS;
+}
 app.get('/api/workspaces/progress', auth, async (req, res) => {
   const rows = await Progress.find({ userId: req.user.id }).select('workspace levels updatedAt');
   res.json({ progress: rows });
@@ -97,12 +111,13 @@ app.get('/api/workspaces/progress', auth, async (req, res) => {
 app.get('/api/workspaces/:slug/levels/:level/questions', auth, async (req, res) => {
   const level = Number(req.params.level), questions = getQuestions(req.params.slug, level);
   if (!questions || !Number.isInteger(level) || level < 1 || level > 6) return res.status(404).json({ error: 'Workspace or level not found.' });
-  const paid = await Deposit.aggregate([{ $match: { userId: new mongoose.Types.ObjectId(req.user.id), status: 'paid' } }, { $group: { _id: null, total: { $sum: '$amount' } } }]);
-  if ((paid[0]?.total || 0) < 650) return res.status(403).json({ error: 'Deposit at least KES 650 and wait for payment confirmation to unlock assessments.' });
+  const wallet = await walletSummary(req.user.id);
+  if (!wallet.assessmentsUnlocked) return res.status(403).json({ error: wallet.totalDeposited < 650 ? 'Deposit at least KES 650 and wait for payment confirmation to unlock assessments.' : 'Your available balance must be at least KES 650 to access assessments. Deposit again to unlock them.' });
   const order = shuffle([...questions]);
   const randomized = order.map(q => { const choices = shuffle(q.choices.map((text,index)=>({text,index}))); return { id:q.id, prompt:q.prompt, choices:choices.map(c=>c.text), correctChoice:choices.findIndex(c=>c.index===q.correct) }; });
   const attempt = await QuestionAttempt.create({ userId:req.user.id, workspace:req.params.slug, level, answers:randomized.map(q=>({questionId:q.id,correctChoice:q.correctChoice})), expiresAt:new Date(Date.now()+60*60*1000) });
-  res.json({ title: WORKSPACES.find(w=>w.slug===req.params.slug).title, level, attemptId:attempt.id, questions:randomized.map(({id,prompt,choices})=>({id,prompt,choices})) });
+  const settings = await getQuizSettings();
+  res.json({ title: WORKSPACES.find(w=>w.slug===req.params.slug).title, level, attemptId:attempt.id, skillPointsPerCorrect: settings.skillPointsPerCorrect, difficultyMultiplier: settings.difficultyMultipliers[level-1] || 1, questions:randomized.map(({id,prompt,choices})=>({id,prompt,choices})) });
 });
 app.post('/api/workspaces/:slug/levels/:level/complete', auth, async (req, res) => {
   const level = Number(req.params.level), answers = req.body?.answers, attemptId=req.body?.attemptId;
@@ -113,18 +128,23 @@ app.post('/api/workspaces/:slug/levels/:level/complete', auth, async (req, res) 
     await session.withTransaction(async () => {
       let progress = await Progress.findOne({ userId: req.user.id, workspace: req.params.slug }).session(session);
       const paid = await Deposit.aggregate([{ $match: { userId: new mongoose.Types.ObjectId(req.user.id), status: 'paid' } }, { $group: { _id: null, total: { $sum: '$amount' } } }]).session(session);
-      if ((paid[0]?.total || 0) < 650) throw Object.assign(new Error('Deposit at least KES 650 and wait for payment confirmation to unlock assessments.'), { status: 403 });
+      const account = await User.findById(req.user.id).select('walletBalance reservedBalance').session(session);
+      const available = account ? account.walletBalance - account.reservedBalance : 0;
+      if ((paid[0]?.total || 0) < 650 || available < 650) throw Object.assign(new Error((paid[0]?.total || 0) < 650 ? 'Deposit at least KES 650 and wait for payment confirmation to unlock assessments.' : 'Your available balance must be at least KES 650 to access assessments. Deposit again to unlock them.'), { status: 403 });
       const attempt = await QuestionAttempt.findOneAndUpdate({ _id:attemptId,userId:req.user.id,workspace:req.params.slug,level,usedAt:null,expiresAt:{$gt:new Date()} },{ $set:{usedAt:new Date()} },{new:true,session});
       if (!attempt || attempt.answers.length !== 10) throw Object.assign(new Error('This quiz attempt expired or was already submitted. Start the level again.'), { status: 409 });
       const score = attempt.answers.reduce((total, question, i) => total + (question.correctChoice === answers[i] ? 1 : 0), 0);
+      const settings = await getQuizSettings(session), points = Math.round(score * settings.skillPointsPerCorrect * (settings.difficultyMultipliers[level-1] || 1));
+      await User.updateOne({ _id: req.user.id }, { $inc: { skillPoints: points } }, { session });
       if (!progress) progress = new Progress({ userId: req.user.id, workspace: req.params.slug, levels: [] });
       const existing = progress.levels.find(row => row.level === level);
       if (score >= 7) {
-        if (existing) { existing.completed = true; existing.score = Math.max(existing.score || 0, score); existing.completedAt = existing.completedAt || new Date(); }
-        else progress.levels.push({ level, completed: true, score, completedAt: new Date() });
-      } else if (!existing) progress.levels.push({ level, completed: false, score, completedAt: null });
+        if (existing) { existing.completed = true; existing.score = Math.max(existing.score || 0, score); existing.points = (existing.points || 0) + points; existing.completedAt = existing.completedAt || new Date(); }
+        else progress.levels.push({ level, completed: true, score, points, completedAt: new Date() });
+      } else if (!existing) progress.levels.push({ level, completed: false, score, points, completedAt: null });
+      else existing.points = (existing.points || 0) + points;
       progress.updatedAt = new Date(); await progress.save({ session });
-      result = { score, total: 10, passed: score >= 7, completedLevels: progress.levels.filter(row=>row.completed).length, nextLevel: score >= 7 && level < 6 ? level + 1 : null };
+      result = { score, total: 10, passed: score >= 7, points, skillPoints: (await User.findById(req.user.id).select('skillPoints').session(session)).skillPoints, completedLevels: progress.levels.filter(row=>row.completed).length, nextLevel: score >= 7 && level < 6 ? level + 1 : null };
     });
   } catch (e) { if (e.status) return res.status(e.status).json({ error: e.message }); throw e; }
   finally { await session.endSession(); }
@@ -132,17 +152,18 @@ app.post('/api/workspaces/:slug/levels/:level/complete', auth, async (req, res) 
 });
 
 async function walletSummary(userId) {
-  const user = await User.findById(userId).select('walletBalance reservedBalance');
+  const user = await User.findById(userId).select('walletBalance reservedBalance skillPoints');
   if (!user) throw new Error('Account not found.');
   const [paidDeposits, earnings] = await Promise.all([
     Deposit.aggregate([{ $match: { userId: user._id, status: 'paid' } }, { $group: { _id: null, total: { $sum: '$amount' } } }]),
     Entry.aggregate([{ $match: { userId: user._id, type: 'earning' } }, { $group: { _id: null, total: { $sum: '$amount' } } }])
   ]);
   const deposited = paidDeposits[0]?.total || 0, available = user.walletBalance - user.reservedBalance;
-  return { balance: user.walletBalance, available, pendingWithdrawals: user.reservedBalance, totalDeposited: deposited, verifiedEarnings: earnings[0]?.total || 0, depositToUnlock: Math.max(0, 650 - deposited), withdrawalGap: Math.max(0, 1250 - available), assessmentsUnlocked: deposited >= 650 };
+  const depositToUnlock = deposited < 650 ? 650 - deposited : Math.max(0, 650 - available);
+  return { balance: user.walletBalance, available, pendingWithdrawals: user.reservedBalance, totalDeposited: deposited, verifiedEarnings: earnings[0]?.total || 0, skillPoints: user.skillPoints || 0, depositToUnlock, accessProgress: Math.min(100, Math.floor(available / 650 * 100)), withdrawalGap: Math.max(0, 1250 - available), assessmentsUnlocked: deposited >= 650 && available >= 650 };
 }
 app.get('/api/wallet', auth, async (req, res) => res.json(await walletSummary(req.user.id)));
-app.get('/api/wallet/transactions', auth, async (req, res) => res.json(await Entry.find({ userId: req.user.id }).sort({ createdAt: -1 }).limit(50).select('type amount reference note createdAt')));
+app.get('/api/wallet/transactions', auth, async (req, res) => res.json(await Entry.find({ userId: req.user.id }).sort({ createdAt: -1 }).limit(50).select('type amount direction reference note createdAt')));
 app.post('/api/admin/login', authLimit, async (req,res) => {
   const email = String(req.body?.email || '').trim().toLowerCase(), password = String(req.body?.password || ''), expected = Buffer.from(process.env.ADMIN_PASSWORD || ''), provided = Buffer.from(password);
   if (!process.env.ADMIN_PASSWORD) return res.status(503).json({ error: 'Administrator password is not configured in Render.' });
@@ -151,6 +172,7 @@ app.post('/api/admin/login', authLimit, async (req,res) => {
   const adminEmail = configuredAdminEmail();
   res.json({ token: jwt.sign({ id: 'admin', email: adminEmail, role: 'admin' }, process.env.JWT_SECRET, { expiresIn: '2h' }) });
 });
+app.get(adminPortalPath(), (_req,res) => { res.set('X-Robots-Tag', 'noindex, nofollow'); res.sendFile(require('path').join(__dirname, 'public', 'index.html')); });
 app.post('/api/admin/earnings', async (req,res) => {
   if(!adminAuthorized(req))return res.sendStatus(401);
   const email=String(req.body?.email||'').trim().toLowerCase(),amount=Number(req.body?.amount),workReference=String(req.body?.workReference||'').trim();
@@ -164,12 +186,43 @@ app.post('/api/admin/earnings', async (req,res) => {
 app.get('/api/admin/overview', async (req,res) => {
   if (!adminAuthorized(req)) return res.sendStatus(401);
   const page = Math.max(1, Math.min(100000, Number.parseInt(req.query.page, 10) || 1)), pageSize = 50;
-  const [members, memberCount, pendingDeposits] = await Promise.all([
-    User.find().sort({ createdAt: -1 }).skip((page - 1) * pageSize).limit(pageSize).select('name username email phone walletBalance createdAt').lean(),
+  const [members, memberCount, pendingDeposits, pendingWithdrawals] = await Promise.all([
+    User.find().sort({ createdAt: -1 }).skip((page - 1) * pageSize).limit(pageSize).select('name username email phone walletBalance reservedBalance skillPoints createdAt').lean(),
     User.countDocuments(),
-    Deposit.find({ status: 'pending' }).sort({ createdAt: 1 }).limit(100).populate('userId', 'name email phone').lean()
+    Deposit.find({ status: 'pending' }).sort({ createdAt: 1 }).limit(100).populate('userId', 'name email phone').lean(),
+    Withdrawal.find({ status: { $in: ['pending', 'processing'] } }).sort({ createdAt: 1 }).limit(100).populate('userId', 'name email phone').lean()
   ]);
-  res.json({ members, memberCount, page, pageSize, pendingDeposits });
+  res.json({ members, memberCount, page, pageSize, pendingDeposits, pendingWithdrawals });
+});
+app.get('/api/admin/settings', async (req,res) => {
+  if (!adminAuthorized(req)) return res.sendStatus(401);
+  res.json(await getQuizSettings());
+});
+app.patch('/api/admin/settings', async (req,res) => {
+  if (!adminAuthorized(req)) return res.sendStatus(401);
+  const skillPointsPerCorrect = Number(req.body?.skillPointsPerCorrect), difficultyMultipliers = req.body?.difficultyMultipliers;
+  if (!Number.isInteger(skillPointsPerCorrect) || skillPointsPerCorrect < 20 || skillPointsPerCorrect > 1000 || !Array.isArray(difficultyMultipliers) || difficultyMultipliers.length !== 6 || difficultyMultipliers.some(n => typeof n !== 'number' || !Number.isFinite(n) || n < 1 || n > 10)) return res.status(400).json({ error: 'Set at least 20 non-cash skill points per correct answer and six difficulty multipliers (1–10).' });
+  const settings = await QuizSettings.findOneAndUpdate({ key: 'main' }, { $set: { skillPointsPerCorrect, difficultyMultipliers, updatedAt: new Date() } }, { new: true, upsert: true, runValidators: true });
+  res.json({ skillPointsPerCorrect: settings.skillPointsPerCorrect, difficultyMultipliers: settings.difficultyMultipliers });
+});
+app.post('/api/admin/members/:id/adjust', async (req,res) => {
+  if (!adminAuthorized(req)) return res.sendStatus(401);
+  if (!mongoose.isValidObjectId(req.params.id)) return res.status(404).json({ error: 'Member not found.' });
+  const amount = Number(req.body?.amount), direction = req.body?.direction, reason = String(req.body?.reason || '').trim();
+  if (!Number.isSafeInteger(amount) || amount < 1 || amount > 100000 || !['credit', 'debit'].includes(direction) || reason.length < 8 || reason.length > 180) return res.status(400).json({ error: 'Enter a KES amount, credit or debit, and a reason (8–180 characters).' });
+  const session = await mongoose.startSession();
+  try {
+    await session.withTransaction(async () => {
+      const filter = direction === 'debit' ? { _id: req.params.id, $expr: { $gte: [{ $subtract: ['$walletBalance', '$reservedBalance'] }, amount] } } : { _id: req.params.id };
+      const delta = direction === 'credit' ? amount : -amount;
+      const user = await User.findOneAndUpdate(filter, { $inc: { walletBalance: delta } }, { new: true, session });
+      if (!user) throw Object.assign(new Error(direction === 'debit' ? 'Member not found or debit exceeds the available balance.' : 'Member not found.'), { status: direction === 'debit' ? 409 : 404 });
+      await Entry.create([{ userId: user._id, type: 'adjustment', amount, direction, reference: `adjust:${crypto.randomUUID()}`, note: reason }], { session });
+      res.locals.adjustedMember = { balance: user.walletBalance, available: user.walletBalance - user.reservedBalance };
+    });
+    res.json({ adjusted: true, ...res.locals.adjustedMember });
+  } catch (e) { if (e.status) return res.status(e.status).json({ error: e.message }); throw e; }
+  finally { await session.endSession(); }
 });
 app.post('/api/admin/deposits/:id/approve', async (req,res) => {
   if (!adminAuthorized(req)) return res.sendStatus(401);
