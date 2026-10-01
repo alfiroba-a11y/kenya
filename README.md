@@ -6,7 +6,7 @@ Kazi Kenya is a Kenya-focused online-work skills hub with 19 workspaces. Each ha
 1. Push this folder to GitHub and create a Render **Web Service** from the repository. Runtime: Node. Build command: `npm install`; start command: `npm start`.
 2. Create a MongoDB Atlas free M0 cluster (Render does not provide a free hosted Mongo database). Allow the Render service outbound access in Atlas network access, create a database user, and set `MONGODB_URI` in Render to the Atlas connection string.
 3. Add the environment variables from `.env.example` in Render. Set `ADMIN_EMAIL` to the sole administrator email and set `ADMIN_PASSWORD` in Render to a new, unique strong password. Never put the administrator password in source control. Generate a unique long random `JWT_SECRET`; keep payment keys and webhook secrets private.
-4. Set a private `ADMIN_PATH` value in Render beginning with `/kz-control-`, keep it out of the repository, and open that path on your deployed host. The portal has no dashboard link and still requires the sole admin email and password.
+4. The app has a fallback `ADMIN_PATH` so a missing variable will not crash startup. Set a private `ADMIN_PATH` in Render beginning with `/kz-control-` if you want a different route, and open that path on your deployed host. The portal still requires the sole admin email and password.
 5. In HashPay, configure the webhook URL as `https://YOUR-RENDER-HOST/api/payments/hashpay/webhook`, then set its signing secret as `HASHPAY_WEBHOOK_SECRET`. Set the payment channel's public account ID as `HASHPAY_ACCOUNT_ID` and its server API key as `HASHPAY_API_KEY`.
 6. Ensure the HashPay account is approved and funded for B2C payouts before enabling withdrawals. B2C credentials are server-only.
 

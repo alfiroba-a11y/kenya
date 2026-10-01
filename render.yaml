@@ -16,7 +16,7 @@ services:
       - key: ADMIN_PASSWORD
         sync: false
       - key: ADMIN_PATH
-        sync: false
+        value: /kz-control-7c91e6d204f5b8a14c3d2e60
       - key: HASHPAY_ACCOUNT_ID
         sync: false
       - key: HASHPAY_API_KEY

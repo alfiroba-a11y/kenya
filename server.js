@@ -35,8 +35,10 @@ const QuizSettings = mongoose.model('QuizSettings', quizSettingsSchema);
 const authLimit = rateLimit({ windowMs: 15 * 60 * 1000, limit: 20, standardHeaders: true, legacyHeaders: false });
 const configuredAdminEmail = () => String(process.env.ADMIN_EMAIL || 'Kiokok614@gmail.com').trim().toLowerCase();
 const adminPortalPath = () => {
-  const path = String(process.env.ADMIN_PATH || '');
-  if (!/^\/kz-control-[a-z0-9-]{12,80}$/i.test(path)) throw new Error('ADMIN_PATH must be set to a private /kz-control-… path.');
+  // Keep a valid fallback so a missing Render env var never prevents the service
+  // from booting. Admin API access still requires the configured admin login.
+  const path = String(process.env.ADMIN_PATH || '/kz-control-7c91e6d204f5b8a14c3d2e60');
+  if (!/^\/kz-control-[a-z0-9-]{12,80}$/i.test(path)) return '/kz-control-7c91e6d204f5b8a14c3d2e60';
   return path;
 };
 function adminAuthorized(req) {
