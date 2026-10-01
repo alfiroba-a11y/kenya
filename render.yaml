@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: kazi-kenya
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /api/health
+    envVars:
+      - key: MONGODB_URI
+        sync: false
+      - key: JWT_SECRET
+        generateValue: true
+      - key: ADMIN_TOKEN
+        generateValue: true
+      - key: HASHPAY_ACCOUNT_ID
+        sync: false
+      - key: HASHPAY_API_KEY
+        sync: false
+      - key: HASHPAY_WEBHOOK_SECRET
+        sync: false
+      - key: HASHPAY_SECURITY_CREDENTIAL
+        sync: false
