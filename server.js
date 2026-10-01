@@ -165,7 +165,19 @@ async function walletSummary(userId) {
   return { balance: user.walletBalance, available, pendingWithdrawals: user.reservedBalance, totalDeposited: deposited, verifiedEarnings: earnings[0]?.total || 0, skillPoints: user.skillPoints || 0, depositToUnlock, accessProgress: Math.min(100, Math.floor(available / 650 * 100)), withdrawalGap: Math.max(0, 1250 - available), assessmentsUnlocked: deposited >= 650 && available >= 650 };
 }
 app.get('/api/wallet', auth, async (req, res) => res.json(await walletSummary(req.user.id)));
-app.get('/api/wallet/transactions', auth, async (req, res) => res.json(await Entry.find({ userId: req.user.id }).sort({ createdAt: -1 }).limit(50).select('type amount direction reference note createdAt')));
+app.get('/api/wallet/transactions', auth, async (req, res) => {
+  const userId = req.user.id;
+  const [entries, deposits, withdrawals] = await Promise.all([
+    Entry.find({ userId }).sort({ createdAt: -1 }).limit(50).select('type amount direction reference note createdAt').lean(),
+    Deposit.find({ userId, status: { $in: ['pending', 'failed'] } }).sort({ createdAt: -1 }).limit(20).select('amount reference status createdAt').lean(),
+    Withdrawal.find({ userId, status: { $in: ['pending', 'processing', 'failed'] } }).sort({ createdAt: -1 }).limit(20).select('amount status createdAt').lean()
+  ]);
+  const pending = [
+    ...deposits.map(d => ({ type: 'deposit', amount: d.amount, direction: 'credit', reference: `pending-dep:${d.reference}`, note: d.status === 'pending' ? 'M-Pesa prompt sent · awaiting payment confirmation' : 'Deposit not completed · no funds added', status: d.status === 'pending' ? 'Prompt sent' : 'Not completed', createdAt: d.createdAt })),
+    ...withdrawals.map(w => ({ type: 'withdrawal', amount: w.amount, direction: 'debit', reference: `pending-wd:${w.id}`, note: w.status === 'pending' ? 'Withdrawal request · awaiting admin review' : w.status === 'processing' ? 'Withdrawal processing' : 'Withdrawal failed · funds released', status: w.status === 'pending' ? 'Awaiting review' : w.status === 'processing' ? 'Processing' : 'Failed · funds released', createdAt: w.createdAt }))
+  ];
+  res.json([...entries.map(e => ({ ...e, status: 'Completed' })), ...pending].sort((a,b) => new Date(b.createdAt)-new Date(a.createdAt)).slice(0,50));
+});
 app.post('/api/admin/login', authLimit, async (req,res) => {
   const email = String(req.body?.email || '').trim().toLowerCase(), password = String(req.body?.password || ''), expected = Buffer.from(process.env.ADMIN_PASSWORD || ''), provided = Buffer.from(password);
   if (!process.env.ADMIN_PASSWORD) return res.status(503).json({ error: 'Administrator password is not configured in Render.' });
@@ -247,8 +259,9 @@ app.post('/api/admin/deposits/:id/approve', async (req,res) => {
   } finally { await session.endSession(); }
 });
 app.get('/api/public/withdrawals/recent', async (_req,res) => {
-  const rows=await Withdrawal.find({status:'paid'}).sort({createdAt:-1}).limit(8).select('amount createdAt');
-  res.json({ withdrawals:rows });
+  const rows=await Withdrawal.find({status:'paid'}).sort({createdAt:-1}).limit(8).select('amount createdAt').lean();
+  // Unique opaque labels keep this real, verified payout feed private and non-repeating.
+  res.json({ withdrawals:rows.filter(row => row.amount <= 12000).map((row,index) => ({ amount: row.amount, createdAt: row.createdAt, member: `Kazi member ${String(index+1).padStart(2,'0')}` })) });
 });
 app.post('/api/payments/deposit', auth, async (req, res) => {
   const amount = Number(req.body?.amount);
@@ -310,7 +323,7 @@ app.post('/api/payments/hashpay/webhook', express.raw({ type: 'application/json'
 app.post('/api/wallet/withdrawals', auth, async (req, res) => {
   const amount = Number(req.body?.amount), profile = await User.findById(req.user.id).select('phone');
   const phone = normalizePhone(req.body?.phone || profile?.phone);
-  if (!Number.isSafeInteger(amount) || amount < 1250 || amount > 100000) return res.status(400).json({ error: 'Withdrawals must be between KES 1,250 and KES 100,000.' });
+  if (!Number.isSafeInteger(amount) || amount < 1250 || amount > 12000) return res.status(400).json({ error: 'Withdrawals must be between KES 1,250 and KES 12,000.' });
   if (!phoneOk(phone)) return res.status(400).json({ error: 'Enter a valid Kenyan mobile number.' });
   if (!profile) return res.status(404).json({ error: 'Account not found.' });
   const session = await mongoose.startSession();
