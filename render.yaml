@@ -17,11 +17,11 @@ services:
         sync: false
       - key: ADMIN_PATH
         value: /kz-control-7c91e6d204f5b8a14c3d2e60
-      - key: HASHPAY_ACCOUNT_ID
+      - key: PAYMENT_ACCOUNT_ID
         sync: false
-      - key: HASHPAY_API_KEY
+      - key: PAYMENT_API_KEY
         sync: false
-      - key: HASHPAY_WEBHOOK_SECRET
+      - key: PAYMENT_WEBHOOK_SECRET
         sync: false
-      - key: HASHPAY_SECURITY_CREDENTIAL
+      - key: PAYMENT_SECURITY_CREDENTIAL
         sync: false

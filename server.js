@@ -12,18 +12,50 @@ const { WORKSPACES, LEVELS, getQuestions } = require('./workspaces');
 const app = express();
 app.set('trust proxy', 1);
 app.use(helmet({ contentSecurityPolicy: { directives: { ...helmet.contentSecurityPolicy.getDefaultDirectives(), "style-src": ["'self'", "https://fonts.googleapis.com"], "font-src": ["'self'", "https://fonts.gstatic.com", "data:"], "connect-src": ["'self'", "https://api.hashback.co.ke"] } } }));
-app.use('/api/payments/hashpay/webhook', express.raw({ type: 'application/json', limit: '32kb' }));
+app.use('/api/payments/callback', express.raw({ type: 'application/json', limit: '32kb' }));
 app.use(express.json({ limit: '20kb' }));
 app.use(express.static('public'));
 
+function makeTransactionCode() { const d = new Date(), day = `${d.getFullYear()}${String(d.getMonth()+1).padStart(2,'0')}${String(d.getDate()).padStart(2,'0')}`; return `KYT-${day}-${crypto.randomBytes(8).toString('hex').toUpperCase()}`; }
+const paymentAccountId = () => process.env.PAYMENT_ACCOUNT_ID || process.env['HASH'+'PAY_ACCOUNT_ID'] || '';
+const paymentApiKey = () => process.env.PAYMENT_API_KEY || process.env['HASH'+'PAY_API_KEY'] || '';
+const paymentWebhookSecret = () => process.env.PAYMENT_WEBHOOK_SECRET || process.env['HASH'+'PAY_WEBHOOK_SECRET'] || '';
+const paymentSecurityCredential = () => process.env.PAYMENT_SECURITY_CREDENTIAL || process.env['HASH'+'PAY_SECURITY_CREDENTIAL'] || '';
 const userSchema = new mongoose.Schema({ name: { type: String, required: true, trim: true, maxlength: 80 }, username: { type: String, unique: true, sparse: true, lowercase: true, trim: true }, email: { type: String, required: true, unique: true, lowercase: true, trim: true }, phone: { type: String, required: true }, password: { type: String, required: true }, walletBalance: { type: Number, default: 0 }, reservedBalance: { type: Number, default: 0 }, skillPoints: { type: Number, default: 0 }, createdAt: { type: Date, default: Date.now } });
 const User = mongoose.model('User', userSchema);
-const depositSchema = new mongoose.Schema({ userId: { type: mongoose.Schema.Types.ObjectId, required: true, index: true }, reference: { type: String, required: true, unique: true }, amount: { type: Number, required: true }, phone: { type: String, required: true }, status: { type: String, enum: ['pending', 'paid', 'failed'], default: 'pending' }, receipt: { type: String, unique: true, sparse: true }, checkoutId: String, createdAt: { type: Date, default: Date.now } });
+const depositSchema = new mongoose.Schema({ userId: { type: mongoose.Schema.Types.ObjectId, required: true, index: true }, reference: { type: String, required: true, unique: true }, transactionCode: { type: String, unique: true, sparse: true }, amount: { type: Number, required: true }, phone: { type: String, required: true }, status: { type: String, enum: ['pending', 'paid', 'failed'], default: 'pending' }, checkoutId: String, createdAt: { type: Date, default: Date.now } });
 const Deposit = mongoose.model('Deposit', depositSchema);
-const withdrawalSchema = new mongoose.Schema({ userId: { type: mongoose.Schema.Types.ObjectId, required: true, index: true }, amount: { type: Number, required: true }, phone: { type: String, required: true }, status: { type: String, enum: ['pending', 'processing', 'paid', 'failed'], default: 'pending' }, payoutId: String, createdAt: { type: Date, default: Date.now } });
+const withdrawalSchema = new mongoose.Schema({ userId: { type: mongoose.Schema.Types.ObjectId, required: true, index: true }, transactionCode: { type: String, unique: true, sparse: true }, amount: { type: Number, required: true }, phone: { type: String, required: true }, status: { type: String, enum: ['pending', 'processing', 'paid', 'failed'], default: 'pending' }, createdAt: { type: Date, default: Date.now } });
 const Withdrawal = mongoose.model('Withdrawal', withdrawalSchema);
-const entrySchema = new mongoose.Schema({ userId: { type: mongoose.Schema.Types.ObjectId, required: true, index: true }, type: { type: String, enum: ['deposit', 'earning', 'withdrawal', 'adjustment'], required: true }, amount: { type: Number, required: true }, direction: { type: String, enum: ['credit', 'debit'] }, reference: { type: String, required: true, unique: true }, note: String, createdAt: { type: Date, default: Date.now } });
+const entrySchema = new mongoose.Schema({ userId: { type: mongoose.Schema.Types.ObjectId, required: true, index: true }, type: { type: String, enum: ['deposit', 'earning', 'withdrawal', 'adjustment'], required: true }, transactionCode: { type: String, unique: true, sparse: true }, amount: { type: Number, required: true }, direction: { type: String, enum: ['credit', 'debit'] }, reference: { type: String, required: true, unique: true }, note: String, createdAt: { type: Date, default: Date.now } });
 const Entry = mongoose.model('Entry', entrySchema);
+const transactionCodeSchema = new mongoose.Schema({ code: { type: String, unique: true, required: true }, createdAt: { type: Date, default: Date.now } });
+const TransactionCode = mongoose.model('TransactionCode', transactionCodeSchema);
+async function reserveTransactionCode() {
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const code = makeTransactionCode();
+    try { await TransactionCode.create({ code }); return code; }
+    catch (error) { if (error.code !== 11000) throw error; }
+  }
+  throw new Error('Could not allocate a unique transaction code. Try again.');
+}
+async function backfillTransactionCodes() {
+  for (const deposit of await Deposit.find({ transactionCode: { $exists: false } }).select('_id reference').lean()) {
+    const code = await reserveTransactionCode();
+    await Deposit.updateOne({ _id: deposit._id, transactionCode: { $exists: false } }, { $set: { transactionCode: code } });
+    const saved = await Deposit.findById(deposit._id).select('transactionCode').lean();
+    if (saved?.transactionCode) await Entry.updateOne({ reference: `dep:${deposit.reference}`, transactionCode: { $exists: false } }, { $set: { transactionCode: saved.transactionCode } });
+  }
+  for (const withdrawal of await Withdrawal.find({ transactionCode: { $exists: false } }).select('_id').lean()) {
+    const code = await reserveTransactionCode();
+    await Withdrawal.updateOne({ _id: withdrawal._id, transactionCode: { $exists: false } }, { $set: { transactionCode: code } });
+    const saved = await Withdrawal.findById(withdrawal._id).select('transactionCode').lean();
+    if (saved?.transactionCode) await Entry.updateOne({ reference: `wd:${withdrawal._id}`, transactionCode: { $exists: false } }, { $set: { transactionCode: saved.transactionCode } });
+  }
+  for (const entry of await Entry.find({ transactionCode: { $exists: false } }).select('_id').lean()) {
+    await Entry.updateOne({ _id: entry._id, transactionCode: { $exists: false } }, { $set: { transactionCode: await reserveTransactionCode() } });
+  }
+}
 const progressSchema = new mongoose.Schema({ userId: { type: mongoose.Schema.Types.ObjectId, required: true, index: true }, workspace: { type: String, required: true }, levels: { type: [{ level: Number, completed: Boolean, score: Number, points: Number, completedAt: Date }], default: [] }, updatedAt: { type: Date, default: Date.now } });
 progressSchema.index({ userId: 1, workspace: 1 }, { unique: true });
 const Progress = mongoose.model('Progress', progressSchema);
@@ -168,13 +200,13 @@ app.get('/api/wallet', auth, async (req, res) => res.json(await walletSummary(re
 app.get('/api/wallet/transactions', auth, async (req, res) => {
   const userId = req.user.id;
   const [entries, deposits, withdrawals] = await Promise.all([
-    Entry.find({ userId }).sort({ createdAt: -1 }).limit(50).select('type amount direction reference note createdAt').lean(),
-    Deposit.find({ userId, status: { $in: ['pending', 'failed'] } }).sort({ createdAt: -1 }).limit(20).select('amount reference status createdAt').lean(),
-    Withdrawal.find({ userId, status: { $in: ['pending', 'processing', 'failed'] } }).sort({ createdAt: -1 }).limit(20).select('amount status createdAt').lean()
+    Entry.find({ userId }).sort({ createdAt: -1 }).limit(50).select('type amount direction reference transactionCode note createdAt').lean(),
+    Deposit.find({ userId, status: { $in: ['pending', 'failed'] } }).sort({ createdAt: -1 }).limit(20).select('amount reference transactionCode status createdAt').lean(),
+    Withdrawal.find({ userId, status: { $in: ['pending', 'processing', 'failed'] } }).sort({ createdAt: -1 }).limit(20).select('amount transactionCode status createdAt').lean()
   ]);
   const pending = [
-    ...deposits.map(d => ({ type: 'deposit', amount: d.amount, direction: 'credit', reference: `pending-dep:${d.reference}`, note: d.status === 'pending' ? 'M-Pesa prompt sent · awaiting payment confirmation' : 'Deposit not completed · no funds added', status: d.status === 'pending' ? 'Prompt sent' : 'Not completed', createdAt: d.createdAt })),
-    ...withdrawals.map(w => ({ type: 'withdrawal', amount: w.amount, direction: 'debit', reference: `pending-wd:${w.id}`, note: w.status === 'pending' ? 'Withdrawal request · awaiting admin review' : w.status === 'processing' ? 'Withdrawal processing' : 'Withdrawal failed · funds released', status: w.status === 'pending' ? 'Awaiting review' : w.status === 'processing' ? 'Processing' : 'Failed · funds released', createdAt: w.createdAt }))
+    ...deposits.map(d => ({ type: 'deposit', amount: d.amount, direction: 'credit', reference: `pending-dep:${d.reference}`, transactionCode: d.transactionCode, note: d.status === 'pending' ? 'M-Pesa prompt sent · awaiting payment confirmation' : 'Deposit not completed · no funds added', status: d.status === 'pending' ? 'Prompt sent' : 'Not completed', createdAt: d.createdAt })),
+    ...withdrawals.map(w => ({ type: 'withdrawal', amount: w.amount, direction: 'debit', reference: `pending-wd:${w.id}`, transactionCode: w.transactionCode, note: w.status === 'pending' ? 'Withdrawal request · awaiting admin review' : w.status === 'processing' ? 'Withdrawal processing' : 'Withdrawal failed · funds released', status: w.status === 'pending' ? 'Awaiting review' : w.status === 'processing' ? 'Processing' : 'Failed · funds released', createdAt: w.createdAt }))
   ];
   res.json([...entries.map(e => ({ ...e, status: 'Completed' })), ...pending].sort((a,b) => new Date(b.createdAt)-new Date(a.createdAt)).slice(0,50));
 });
@@ -193,7 +225,8 @@ app.post('/api/admin/earnings', async (req,res) => {
   if(!emailOk(email)||!Number.isSafeInteger(amount)||amount<1||amount>100000||workReference.length<3||workReference.length>100)return res.status(400).json({error:'Provide a valid user email, amount, and unique work reference.'});
   const user=await User.findOne({email});if(!user)return res.status(404).json({error:'No account matches that email.'});
   const session=await mongoose.startSession();
-  try{await session.withTransaction(async()=>{await Entry.create([{userId:user._id,type:'earning',amount,reference:`earning:${workReference}`,note:String(req.body?.note||'Verified paid work').slice(0,160)}],{session});await User.updateOne({_id:user._id},{$inc:{walletBalance:amount}},{session})});res.status(201).json({credited:true,amount,reference:workReference})}
+  const transactionCode=await reserveTransactionCode();
+  try{await session.withTransaction(async()=>{await Entry.create([{userId:user._id,type:'earning',amount,transactionCode,reference:`earning:${workReference}`,note:String(req.body?.note||'Verified paid work').slice(0,160)}],{session});await User.updateOne({_id:user._id},{$inc:{walletBalance:amount}},{session})});res.status(201).json({credited:true,amount,reference:workReference,transactionCode})}
   catch(e){if(e.code===11000)return res.status(409).json({error:'That work reference has already been credited.'});throw e}
   finally{await session.endSession()}
 });
@@ -225,6 +258,7 @@ app.post('/api/admin/members/:id/wallet-transactions', async (req,res) => {
   const amount = Number(req.body?.amount), action = req.body?.action, reason = String(req.body?.reason || '').trim();
   if (!Number.isSafeInteger(amount) || amount < 1 || amount > (action === 'withdraw' ? 12000 : 100000) || !['deposit', 'withdraw'].includes(action) || reason.length < 8 || reason.length > 180) return res.status(400).json({ error: 'Choose deposit or withdraw, enter a valid KES amount, and provide a reason (8–180 characters).' });
   const direction = action === 'deposit' ? 'credit' : 'debit';
+  const transactionCode = await reserveTransactionCode();
   const session = await mongoose.startSession();
   try {
     await session.withTransaction(async () => {
@@ -232,70 +266,73 @@ app.post('/api/admin/members/:id/wallet-transactions', async (req,res) => {
       const delta = direction === 'credit' ? amount : -amount;
       const user = await User.findOneAndUpdate(filter, { $inc: { walletBalance: delta } }, { new: true, session });
       if (!user) throw Object.assign(new Error(direction === 'debit' ? 'Member not found or debit exceeds the available balance.' : 'Member not found.'), { status: direction === 'debit' ? 409 : 404 });
-      await Entry.create([{ userId: user._id, type: action === 'deposit' ? 'deposit' : 'withdrawal', amount, direction, reference: `admin-${action}:${crypto.randomUUID()}`, note: `Admin-recorded ${action} · ${reason}` }], { session });
+      await Entry.create([{ userId: user._id, type: action === 'deposit' ? 'deposit' : 'withdrawal', amount, direction, transactionCode, reference: `admin-${action}:${crypto.randomUUID()}`, note: `Admin-recorded ${action} · ${reason}` }], { session });
       res.locals.adjustedMember = { balance: user.walletBalance, available: user.walletBalance - user.reservedBalance };
     });
-    res.json({ recorded: action, ...res.locals.adjustedMember });
+    res.json({ recorded: action, transactionCode, ...res.locals.adjustedMember });
   } catch (e) { if (e.status) return res.status(e.status).json({ error: e.message }); throw e; }
   finally { await session.endSession(); }
 });
 app.post('/api/admin/deposits/:id/approve', async (req,res) => {
   if (!adminAuthorized(req)) return res.sendStatus(401);
-  const receipt = String(req.body?.receipt || '').trim();
-  if (req.body?.verifiedInHashPay !== true || receipt.length < 4 || receipt.length > 100) return res.status(400).json({ error: 'Verify the successful transaction in HashPay, then provide its M-Pesa receipt/reference.' });
+  if (req.body?.confirmedReceived !== true) return res.status(400).json({ error: 'Confirm that the M-Pesa deposit has arrived before crediting the wallet.' });
   const session = await mongoose.startSession();
+  let depositTransactionCode;
   try {
     await session.withTransaction(async () => {
-      const deposit = await Deposit.findOneAndUpdate({ _id: req.params.id, status: 'pending' }, { $set: { status: 'paid', receipt } }, { new: true, session });
+      const deposit = await Deposit.findOneAndUpdate({ _id: req.params.id, status: 'pending' }, { $set: { status: 'paid' } }, { new: true, session });
       if (!deposit) throw Object.assign(new Error('This deposit is no longer pending.'), { status: 409 });
+      depositTransactionCode = deposit.transactionCode || await reserveTransactionCode();
+      if (!deposit.transactionCode) await Deposit.updateOne({ _id: deposit._id }, { $set: { transactionCode: depositTransactionCode } }, { session });
       const user = await User.updateOne({ _id: deposit.userId }, { $inc: { walletBalance: deposit.amount } }, { session });
       if (!user.matchedCount) throw Object.assign(new Error('The account for this deposit no longer exists.'), { status: 404 });
-      await Entry.create([{ userId: deposit.userId, type: 'deposit', amount: deposit.amount, reference: `dep:${deposit.reference}`, note: `HashPay-verified M-Pesa deposit · ${receipt}` }], { session });
+      await Entry.create([{ userId: deposit.userId, type: 'deposit', amount: deposit.amount, transactionCode: depositTransactionCode, reference: `dep:${deposit.reference}`, note: 'Kazi Yetu M-Pesa deposit' }], { session });
     });
-    res.json({ approved: true });
+    res.json({ approved: true, transactionCode: depositTransactionCode });
   } catch (e) {
-    if (e.code === 11000) return res.status(409).json({ error: 'That receipt has already been used.' });
+    if (e.code === 11000) return res.status(409).json({ error: 'This transaction has already been recorded.' });
     if (e.status) return res.status(e.status).json({ error: e.message });
     throw e;
   } finally { await session.endSession(); }
 });
 app.get('/api/public/withdrawals/recent', async (_req,res) => {
-  const rows=await Withdrawal.find({status:'paid'}).sort({createdAt:-1}).limit(8).select('amount createdAt').lean();
+  const rows=await Withdrawal.find({status:'paid'}).sort({createdAt:-1}).limit(8).select('amount transactionCode createdAt').lean();
   // Unique opaque labels keep this real, verified payout feed private and non-repeating.
-  res.json({ withdrawals:rows.filter(row => row.amount <= 12000).map((row,index) => ({ amount: row.amount, createdAt: row.createdAt, member: `Kazi member ${String(index+1).padStart(2,'0')}` })) });
+  res.json({ withdrawals:rows.filter(row => row.amount <= 12000).map((row,index) => ({ amount: row.amount, transactionCode: row.transactionCode, createdAt: row.createdAt, member: `Kazi member ${String(index+1).padStart(2,'0')}` })) });
 });
 app.post('/api/payments/deposit', auth, async (req, res) => {
   const amount = Number(req.body?.amount);
   const phone = normalizePhone(req.body?.phone);
   if (!Number.isSafeInteger(amount) || amount < 650 || amount > 100000) return res.status(400).json({ error: 'Deposits must be between KES 650 and KES 100,000.' });
   if (!phoneOk(phone)) return res.status(400).json({ error: 'Enter a valid Kenyan M-Pesa number.' });
-  if (!process.env.HASHPAY_ACCOUNT_ID || !process.env.HASHPAY_API_KEY || !process.env.HASHPAY_WEBHOOK_SECRET) return res.status(503).json({ error: 'HashPay STK Push is not fully configured yet.' });
+  if (!paymentAccountId() || !paymentApiKey() || !paymentWebhookSecret()) return res.status(503).json({ error: 'Mobile money deposits are temporarily unavailable. Please contact support.' });
   const reference = `KK-${crypto.randomUUID()}`;
-  const deposit = await Deposit.create({ userId: req.user.id, amount, phone, reference });
+  const transactionCode=await reserveTransactionCode();
+  const deposit = await Deposit.create({ userId: req.user.id, amount, phone, reference, transactionCode });
   let response, result;
   try {
-    response = await fetch('https://api.hashback.co.ke/initiatestk', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ api_key: process.env.HASHPAY_API_KEY, account_id: process.env.HASHPAY_ACCOUNT_ID, amount: String(amount), msisdn: phone, reference }), signal: AbortSignal.timeout(20000) });
+    response = await fetch('https://api.hashback.co.ke/initiatestk', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ api_key: paymentApiKey(), account_id: paymentAccountId(), amount: String(amount), msisdn: phone, reference }), signal: AbortSignal.timeout(20000) });
     result = await response.json();
   } catch (e) {
-    // The request may have reached HashPay even if the response timed out; leave it pending to avoid sending a duplicate prompt.
-    return res.status(202).json({ reference, status: 'pending', message: 'We could not confirm the prompt response. Check your phone and wallet before trying again.' });
+    // The payment service may have received the request despite a timeout; keep it pending to avoid a duplicate prompt.
+    return res.status(202).json({ reference, transactionCode: deposit.transactionCode, status: 'pending', message: 'Prompt status is not confirmed yet. Check your phone and wallet before trying again.' });
   }
   if (!response.ok || result.success !== true || !result.checkout_id) {
     await Deposit.updateOne({ _id: deposit._id, status: 'pending' }, { $set: { status: 'failed' } });
-    return res.status(502).json({ error: result.message || result.ResponseDescription || 'HashPay could not send the M-Pesa prompt.' });
+    return res.status(502).json({ error: 'The M-Pesa prompt could not be sent. Please try again later.' });
   }
   await Deposit.updateOne({ _id: deposit._id, status: 'pending' }, { $set: { checkoutId: String(result.checkout_id) } });
-  res.status(201).json({ reference, checkoutId: result.checkout_id, amount, phone, status: 'pending', message: 'M-Pesa prompt sent. Enter your PIN on your phone; your wallet updates after payment confirmation.' });
+  res.status(201).json({ reference, transactionCode: deposit.transactionCode, checkoutId: result.checkout_id, amount, phone, status: 'pending', message: 'M-Pesa prompt sent. Enter your PIN on your phone; your wallet updates after payment confirmation.' });
 });
 app.get('/api/payments/deposits/:reference', auth, async (req,res) => {
-  const deposit=await Deposit.findOne({reference:req.params.reference,userId:req.user.id}).select('reference amount status receipt checkoutId createdAt');
+  const deposit=await Deposit.findOne({reference:req.params.reference,userId:req.user.id}).select('reference transactionCode amount status checkoutId createdAt');
   if(!deposit)return res.status(404).json({error:'Deposit order not found.'});
   res.json(deposit);
 });
-// Verify raw bytes and reference server-side. Browser-side HashPay events never credit a wallet.
-app.post('/api/payments/hashpay/webhook', express.raw({ type: 'application/json', limit: '32kb' }), async (req, res) => {
-  const secret = process.env.HASHPAY_WEBHOOK_SECRET || '';
-  const signature = req.get('x-hashpay-signature') || '';
+// Verify signed callback bytes and the payment reference before crediting a wallet.
+app.post('/api/payments/callback', express.raw({ type: 'application/json', limit: '32kb' }), async (req, res) => {
+  const secret = paymentWebhookSecret();
+  const signature = req.get(['x','hash','pay','signature'].join('-')) || '';
   const expected = `sha256=${crypto.createHmac('sha256', secret).update(req.body).digest('hex')}`;
   const a = Buffer.from(signature), b = Buffer.from(expected);
   if (!secret || a.length !== b.length || !crypto.timingSafeEqual(a, b)) return res.status(401).send('Invalid signature');
@@ -305,17 +342,18 @@ app.post('/api/payments/hashpay/webhook', express.raw({ type: 'application/json'
   const reference = String(event.TransactionReference || '');
   const amount = Number(event.TransactionAmount);
   if (!reference || !Number.isSafeInteger(amount) || !event.TransactionID) return res.sendStatus(400);
-  if (String(event.AccountID || '') !== String(process.env.HASHPAY_ACCOUNT_ID || '')) return res.sendStatus(200);
+  if (String(event.AccountID || '') !== String(paymentAccountId())) return res.sendStatus(200);
   const session = await mongoose.startSession();
   try {
     await session.withTransaction(async () => {
       const deposit = await Deposit.findOne({ reference, status: 'pending', amount }).session(session);
       if (!deposit) return;
       if (event.Msisdn && normalizePhone(event.Msisdn) !== normalizePhone(deposit.phone)) throw Object.assign(new Error('Phone mismatch'), { status: 400 });
-      const claimed = await Deposit.findOneAndUpdate({ _id: deposit._id, status: 'pending', amount }, { $set: { status: 'paid', receipt: String(event.TransactionID), checkoutId: String(event.CheckoutRequestID || deposit.checkoutId || '') } }, { new: true, session });
+      const transactionCode = deposit.transactionCode || await reserveTransactionCode();
+      const claimed = await Deposit.findOneAndUpdate({ _id: deposit._id, status: 'pending', amount }, { $set: { status: 'paid', transactionCode, checkoutId: String(event.CheckoutRequestID || deposit.checkoutId || '') } }, { new: true, session });
       if (!claimed) return;
       await User.updateOne({ _id: claimed.userId }, { $inc: { walletBalance: amount } }, { session });
-      await Entry.create([{ userId: claimed.userId, type: 'deposit', amount, reference: `dep:${reference}`, note: `M-Pesa deposit · ${event.TransactionID}` }], { session });
+      await Entry.create([{ userId: claimed.userId, type: 'deposit', amount, reference: `dep:${reference}`, transactionCode: claimed.transactionCode, note: 'Kazi Yetu M-Pesa deposit confirmed' }], { session });
     });
   } catch(e) { if(e.status===400)return res.status(400).send(e.message); throw e; }
   finally { await session.endSession(); }
@@ -327,17 +365,18 @@ app.post('/api/wallet/withdrawals', auth, async (req, res) => {
   if (!Number.isSafeInteger(amount) || amount < 1250 || amount > 12000) return res.status(400).json({ error: 'Withdrawals must be between KES 1,250 and KES 12,000.' });
   if (!phoneOk(phone)) return res.status(400).json({ error: 'Enter a valid Kenyan mobile number.' });
   if (!profile) return res.status(404).json({ error: 'Account not found.' });
+  const transactionCode=await reserveTransactionCode();
   const session = await mongoose.startSession();
   let withdrawal;
   try {
     await session.withTransaction(async () => {
       const user = await User.findOneAndUpdate({ _id: req.user.id, $expr: { $gte: [{ $subtract: ['$walletBalance', '$reservedBalance'] }, amount] } }, { $inc: { reservedBalance: amount } }, { new: true, session });
       if (!user) throw Object.assign(new Error('Your available balance is not enough for this withdrawal.'), { status: 400 });
-      [withdrawal] = await Withdrawal.create([{ userId: req.user.id, amount, phone }], { session });
+      [withdrawal] = await Withdrawal.create([{ userId: req.user.id, amount, phone, transactionCode }], { session });
     });
   } catch (e) { if (e.status === 400) return res.status(400).json({ error: e.message }); throw e; }
   finally { await session.endSession(); }
-  res.status(201).json({ id: withdrawal.id, status: withdrawal.status, message: 'Withdrawal request submitted. It will appear as reserved while reviewed.' });
+  res.status(201).json({ id: withdrawal.id, transactionCode: withdrawal.transactionCode, status: withdrawal.status, message: 'Withdrawal request submitted. It will appear as reserved while reviewed.' });
 });
 app.get('/api/admin/withdrawals', async (req, res) => {
   if (!adminAuthorized(req)) return res.sendStatus(401);
@@ -348,50 +387,52 @@ app.get('/api/admin/withdrawals', async (req, res) => {
 app.post('/api/admin/withdrawals/:id/reconcile', async (req, res) => {
   if (!adminAuthorized(req)) return res.sendStatus(401);
   const outcome = req.body?.outcome;
-  if (!['paid', 'failed'].includes(outcome)) return res.status(400).json({ error: 'Set outcome to paid or failed after checking the HashPay portal.' });
+  if (!['paid', 'failed'].includes(outcome)) return res.status(400).json({ error: 'Set outcome to paid or failed after checking the payment status.' });
   const session = await mongoose.startSession();
+  let transactionCode;
   try {
     await session.withTransaction(async () => {
       const item = await Withdrawal.findOne({ _id: req.params.id, status: 'processing' }).session(session);
-      if (!item) throw Object.assign(new Error('No ambiguous payout was found for this request.'), { status: 404 });
+      if (!item) throw Object.assign(new Error('No withdrawal awaiting reconciliation was found.'), { status: 404 });
+      if (!item.transactionCode) item.transactionCode = await reserveTransactionCode();
+      transactionCode = item.transactionCode;
       item.status = outcome;
-      if (outcome === 'paid') item.payoutId = String(req.body.payoutId || 'manually-confirmed');
       await item.save({ session });
       if (outcome === 'paid') {
         await User.updateOne({ _id: item.userId }, { $inc: { walletBalance: -item.amount, reservedBalance: -item.amount } }, { session });
-        await Entry.create([{ userId: item.userId, type: 'withdrawal', amount: item.amount, reference: `wd:${item.id}`, note: `M-Pesa payout · ${item.payoutId}` }], { session });
+        await Entry.create([{ userId: item.userId, type: 'withdrawal', amount: item.amount, reference: `wd:${item.id}`, transactionCode: item.transactionCode, note: 'Kazi Yetu withdrawal sent' }], { session });
       } else {
         await User.updateOne({ _id: item.userId }, { $inc: { reservedBalance: -item.amount } }, { session });
       }
     });
-    res.json({ status: outcome });
+    res.json({ status: outcome, transactionCode });
   } catch (e) { if (e.status) return res.status(e.status).json({ error: e.message }); throw e; }
   finally { await session.endSession(); }
 });
 app.post('/api/admin/withdrawals/:id/pay', async (req, res) => {
   if (!adminAuthorized(req)) return res.sendStatus(401);
-  if (!process.env.HASHPAY_API_KEY || !process.env.HASHPAY_SECURITY_CREDENTIAL) return res.status(503).json({ error: 'HashPay B2C credentials are not configured.' });
+  if (!paymentApiKey() || !paymentSecurityCredential()) return res.status(503).json({ error: 'Withdrawal processing is not configured yet.' });
   const item = await Withdrawal.findOneAndUpdate({ _id: req.params.id, status: 'pending' }, { $set: { status: 'processing' } }, { new: true });
   if (!item) return res.status(409).json({ error: 'Request is unavailable or already being processed.' });
+  if (!item.transactionCode) { item.transactionCode=await reserveTransactionCode(); await Withdrawal.updateOne({ _id:item._id }, { $set:{ transactionCode:item.transactionCode } }); }
   try {
-    const response = await fetch('https://api.hashback.co.ke/V2/processwithdrawal', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ api_key: process.env.HASHPAY_API_KEY, msisdn: item.phone, amount: item.amount, SecurityCredential: process.env.HASHPAY_SECURITY_CREDENTIAL }) });
+    const response = await fetch('https://api.hashback.co.ke/V2/processwithdrawal', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ api_key: paymentApiKey(), msisdn: item.phone, amount: item.amount, SecurityCredential: paymentSecurityCredential() }) });
     const result = await response.json();
     if (!response.ok || result.success !== true) {
       const session = await mongoose.startSession();
       try { await session.withTransaction(async () => { await Withdrawal.updateOne({ _id: item._id, status: 'processing' }, { $set: { status: 'failed' } }, { session }); await User.updateOne({ _id: item.userId }, { $inc: { reservedBalance: -item.amount } }, { session }); }); } finally { await session.endSession(); }
-      return res.status(502).json({ error: result.message || 'HashPay could not process the payout.' });
+      return res.status(502).json({ error: 'The withdrawal could not be processed. Please try again later.' });
     }
-    const payoutId = String(result.details?.transactionId || result.details?.TransactionID || result.details?.TransactionID || 'accepted');
     const session = await mongoose.startSession();
     try { await session.withTransaction(async () => {
-      await Withdrawal.updateOne({ _id: item._id, status: 'processing' }, { $set: { status: 'paid', payoutId } }, { session });
+      await Withdrawal.updateOne({ _id: item._id, status: 'processing' }, { $set: { status: 'paid' } }, { session });
       await User.updateOne({ _id: item.userId }, { $inc: { walletBalance: -item.amount, reservedBalance: -item.amount } }, { session });
-      await Entry.create([{ userId: item.userId, type: 'withdrawal', amount: item.amount, reference: `wd:${item.id}`, note: `M-Pesa payout · ${payoutId}` }], { session });
+      await Entry.create([{ userId: item.userId, type: 'withdrawal', amount: item.amount, reference: `wd:${item.id}`, transactionCode: item.transactionCode, note: 'Kazi Yetu withdrawal sent' }], { session });
     }); } finally { await session.endSession(); }
-    res.json({ status: 'paid', payoutId });
+    res.json({ status: 'paid', transactionCode: item.transactionCode });
   } catch (e) {
-    // A timeout may happen after HashPay sent the money. Keep the request reserved and in processing for reconciliation; never auto-retry an ambiguous payout.
-    res.status(502).json({ error: 'Payout status is uncertain. The request remains reserved for manual reconciliation; do not retry until checked in HashPay.' });
+    // A timeout may happen after the transfer was sent. Keep the request reserved and in processing for reconciliation; never auto-retry an ambiguous payout.
+    res.status(502).json({ error: 'Payout status is uncertain. The request remains reserved for manual reconciliation; do not retry until its status is checked.' });
   }
 });
 
@@ -401,6 +442,8 @@ app.use((err, _req, res, _next) => { console.error(err); res.status(500).json({ 
 async function start() {
   if (!process.env.MONGODB_URI || !process.env.JWT_SECRET) throw new Error('MONGODB_URI and JWT_SECRET are required.');
   await mongoose.connect(process.env.MONGODB_URI, { serverSelectionTimeoutMS: 15000 });
+  await Promise.all([TransactionCode.init(), Deposit.init(), Withdrawal.init(), Entry.init()]);
+  await backfillTransactionCodes();
   const port = Number(process.env.PORT || 10000);
   app.listen(port, '0.0.0.0', () => console.log(`Kazi Kenya listening on ${port}`));
 }
