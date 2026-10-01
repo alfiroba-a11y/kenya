@@ -30,3 +30,6 @@
 @media(max-width:900px){.financial-overview{grid-template-columns:repeat(3,minmax(0,1fr))}}
 @media(max-width:650px){.financial-overview{grid-template-columns:repeat(2,minmax(0,1fr))}.financial-overview article{min-height:100px;padding:12px}.financial-overview strong{font-size:15px}.admin-deposit{grid-template-columns:1fr}.admin-deposit .btn{width:100%}}
 .admin-pager{display:flex;align-items:center;justify-content:center;gap:12px;margin:10px 0}.admin-pager .btn{padding:8px 12px;font-size:9px}.admin-pager button:disabled{opacity:.45;cursor:not-allowed}
+
+.top-wallet-actions{display:flex;align-items:center;gap:7px}.top-wallet-actions .btn{padding:9px 11px;font-size:10px;gap:6px}.top-wallet-actions #topWithdraw:disabled{opacity:.5;cursor:not-allowed}.authenticated .hero,.authenticated .ticker,.authenticated .how-section,.authenticated .cta-section{display:none}.authenticated .topbar nav a[href="#how"]{display:none}
+@media(max-width:650px){.top-wallet-actions{gap:5px}.top-wallet-actions .btn{padding:9px 8px;font-size:9px;gap:3px}.top-actions{gap:6px}.top-actions .avatar{width:30px;height:30px}}
