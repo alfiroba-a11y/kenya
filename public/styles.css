@@ -5,3 +5,5 @@
 @media(max-width:390px){.workspace-grid{grid-template-columns:1fr}.workspace-card{min-height:155px}.hero h1{font-size:54px}.hero-bottom{font-size:6px}.trust-row{gap:8px}.hero-preview{padding:18px}.preview-balance strong{font-size:29px}.how-steps{grid-template-columns:1fr 1fr}.level-grid{grid-template-columns:repeat(2,1fr)}.activity-card #recentWithdrawals{grid-template-columns:1fr}}
 
 .withdraw-hint{position:relative;z-index:2;margin-top:8px;color:#c4d3c2;font-size:7px}.wallet-acts .btn:disabled{opacity:.46;cursor:not-allowed;transform:none;box-shadow:none}
+
+.password-separator{height:1px;background:#e5e9e2;margin:17px 0 10px}.password-toggle{padding:6px 0;color:#507642;font-size:10px;font-weight:700}.logout-btn{display:block;margin:17px auto 0;padding:6px 12px;background:transparent;color:#a14b3c;font-size:9px;font-weight:700}
