@@ -1,6 +1,6 @@
 # Kazi Kenya
 
-Kazi Kenya is a Kenya-focused online-work skills hub with 19 workspaces. Each has six sequential levels of 10 job-focused questions. Level 1 is free; questions and answer choices are randomized, and a score of 7/10 unlocks the next level. Progress is saved per account in MongoDB.
+Kazi Kenya is a Kenya-focused online-work skills hub with 19 workspaces. Each has six job-focused levels of 10 questions. Question order and answer choices are randomized. Every level is locked until confirmed deposits total KES 650; then all levels open and scores track learning progress. Progress is saved per account in MongoDB.
 
 ## Deploy on Render
 1. Push this folder to GitHub and create a Render **Web Service** from the repository. Runtime: Node. Build command: `npm install`; start command: `npm start`.
@@ -15,8 +15,8 @@ MongoDB Atlas is used because Render's free web service does not bundle a persis
 - Deposit initiation asks for the user's M-Pesa number in the Kazi Kenya wallet, then the server calls HashPay's STK Push endpoint to send the prompt directly to that phone. The deposit remains pending until a valid HMAC-SHA256 signed HashPay webhook confirms the exact amount, phone, account, and reference; only then is the wallet credited once. The hosted checkout is not opened in the site.
 - Withdrawals (KES 1,250 minimum) are enabled once a user's available balance reaches KES 1,250. Requests are held as pending against the user's wallet and require an admin review. An authorized admin triggers the HashPay B2C payout; duplicate payouts are prevented with an atomic status transition. Configure `ADMIN_TOKEN` securely and expose its use only to a trusted operator.
 - Profile settings allow name/username changes and password changes with current-password verification. Withdrawal requests can specify their M-Pesa destination.
-- Workspace quizzes save learning progress but do not award money. The KES 1,250 shown while logged out is labeled demo preview and is not a real balance.
-- New accounts start at KES 0. Only verified deposits and operator-credited client-paid work affect the wallet. A level completion is not a promise of a job or earnings.
+- Workspace quizzes save learning progress but do not award money. Quiz answers do not add to or deduct from the cash wallet. Earnings shown are only operator-credited, verified client-paid work.
+- New accounts start at KES 0. Only confirmed deposits and operator-credited client-paid work affect the wallet. Admin deposit approval requires checking the actual successful HashPay transaction and receipt before crediting. A level completion is not a promise of a job or earnings.
 
 ## API overview
 - `POST /api/auth/register`, `POST /api/auth/login`
@@ -27,6 +27,8 @@ MongoDB Atlas is used because Render's free web service does not bundle a persis
 - `POST /api/payments/deposit` `{ "amount": 650, "phone": "0712345678" }` (minimum KES 650; starts an M-Pesa STK prompt)
 - `POST /api/wallet/withdrawals` `{ "amount": 1250, "phone": "0712345678" }` (minimum KES 1,250)
 - `POST /api/payments/hashpay/webhook` (HashPay signed callback)
+- `GET /api/admin/overview` with `x-admin-token: $ADMIN_TOKEN` (members and pending deposits)
+- `POST /api/admin/deposits/:id/approve` with a verified HashPay receipt (manual reconciliation)
 - `GET /api/health`
 - Operator queue: `GET /api/admin/withdrawals` with `x-admin-token: $ADMIN_TOKEN`; trigger `POST /api/admin/withdrawals/:id/pay` with the same header.
 - Credit `POST /api/admin/earnings` only after real client-paid work is verified. Send `{ "email": "worker@example.com", "amount": 500, "workReference": "client-task-unique-id" }` with `x-admin-token: $ADMIN_TOKEN`. The work reference is idempotent. Quiz results never add wallet money.

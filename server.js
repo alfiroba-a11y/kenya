@@ -42,13 +42,22 @@ const usernameOk = v => typeof v === 'string' && /^[a-zA-Z0-9_]{3,20}$/.test(v);
 
 app.get('/api/health', (_req, res) => res.json({ ok: mongoose.connection.readyState === 1, database: 'mongodb' }));
 app.post('/api/auth/register', authLimit, async (req, res) => {
-  const { name, email, phone, password } = req.body || {};
+  const { name, phone, password } = req.body || {}, email = String(req.body?.email || '').trim().toLowerCase();
   if (typeof name !== 'string' || name.trim().length < 2 || name.length > 80 || !emailOk(email) || !phoneOk(phone) || typeof password !== 'string' || password.length < 10) return res.status(400).json({ error: 'Enter your name, a valid email, Kenyan M-Pesa number, and password of at least 10 characters.' });
-  try {
-    const usernameBase = name.toLowerCase().replace(/[^a-z0-9_]/g, '').slice(0, 14) || 'kaziuser';
-    const user = await User.create({ name: name.trim(), username: `${usernameBase}_${crypto.randomInt(1000,9999)}`, email, phone: normalizePhone(phone), password: await bcrypt.hash(password, 12) });
-    res.status(201).json(issueToken(user));
-  } catch (e) { if (e.code === 11000) return res.status(409).json({ error: 'An account already uses this email.' }); throw e; }
+  if (await User.exists({ email })) return res.status(409).json({ error: 'An account already uses this email. Log in or use a different email.' });
+  const usernameBase = name.toLowerCase().replace(/[^a-z0-9_]/g, '').slice(0, 14) || 'kaziuser';
+  const hash = await bcrypt.hash(password, 12);
+  for (let attempt = 0; attempt < 5; attempt++) {
+    try {
+      const user = await User.create({ name: name.trim(), username: `${usernameBase}_${crypto.randomInt(1000,9999)}`, email, phone: normalizePhone(phone), password: hash });
+      return res.status(201).json(issueToken(user));
+    } catch (e) {
+      if (e.code !== 11000) throw e;
+      if (e.keyPattern?.email || await User.exists({ email })) return res.status(409).json({ error: 'An account already uses this email. Log in or use a different email.' });
+      if (!e.keyPattern?.username) throw e;
+    }
+  }
+  res.status(503).json({ error: 'We could not finish creating your account. Please try again.' });
 });
 app.post('/api/auth/login', authLimit, async (req, res) => {
   const { email, password } = req.body || {};
@@ -79,10 +88,8 @@ app.get('/api/workspaces/progress', auth, async (req, res) => {
 app.get('/api/workspaces/:slug/levels/:level/questions', auth, async (req, res) => {
   const level = Number(req.params.level), questions = getQuestions(req.params.slug, level);
   if (!questions || !Number.isInteger(level) || level < 1 || level > 6) return res.status(404).json({ error: 'Workspace or level not found.' });
-  if (level > 1) {
-    const progress = await Progress.findOne({ userId: req.user.id, workspace: req.params.slug });
-    if (!progress?.levels.some(row => row.level === level - 1 && row.completed)) return res.status(403).json({ error: 'Complete the previous level to unlock this one.' });
-  }
+  const paid = await Deposit.aggregate([{ $match: { userId: new mongoose.Types.ObjectId(req.user.id), status: 'paid' } }, { $group: { _id: null, total: { $sum: '$amount' } } }]);
+  if ((paid[0]?.total || 0) < 650) return res.status(403).json({ error: 'Deposit at least KES 650 and wait for payment confirmation to unlock assessments.' });
   const order = shuffle([...questions]);
   const randomized = order.map(q => { const choices = shuffle(q.choices.map((text,index)=>({text,index}))); return { id:q.id, prompt:q.prompt, choices:choices.map(c=>c.text), correctChoice:choices.findIndex(c=>c.index===q.correct) }; });
   const attempt = await QuestionAttempt.create({ userId:req.user.id, workspace:req.params.slug, level, answers:randomized.map(q=>({questionId:q.id,correctChoice:q.correctChoice})), expiresAt:new Date(Date.now()+60*60*1000) });
@@ -96,7 +103,8 @@ app.post('/api/workspaces/:slug/levels/:level/complete', auth, async (req, res) 
   try {
     await session.withTransaction(async () => {
       let progress = await Progress.findOne({ userId: req.user.id, workspace: req.params.slug }).session(session);
-      if (level > 1 && !progress?.levels.some(row => row.level === level - 1 && row.completed)) throw Object.assign(new Error('Complete the previous level to unlock this one.'), { status: 403 });
+      const paid = await Deposit.aggregate([{ $match: { userId: new mongoose.Types.ObjectId(req.user.id), status: 'paid' } }, { $group: { _id: null, total: { $sum: '$amount' } } }]).session(session);
+      if ((paid[0]?.total || 0) < 650) throw Object.assign(new Error('Deposit at least KES 650 and wait for payment confirmation to unlock assessments.'), { status: 403 });
       const attempt = await QuestionAttempt.findOneAndUpdate({ _id:attemptId,userId:req.user.id,workspace:req.params.slug,level,usedAt:null,expiresAt:{$gt:new Date()} },{ $set:{usedAt:new Date()} },{new:true,session});
       if (!attempt || attempt.answers.length !== 10) throw Object.assign(new Error('This quiz attempt expired or was already submitted. Start the level again.'), { status: 409 });
       const score = attempt.answers.reduce((total, question, i) => total + (question.correctChoice === answers[i] ? 1 : 0), 0);
@@ -117,7 +125,12 @@ app.post('/api/workspaces/:slug/levels/:level/complete', auth, async (req, res) 
 async function walletSummary(userId) {
   const user = await User.findById(userId).select('walletBalance reservedBalance');
   if (!user) throw new Error('Account not found.');
-  return { balance: user.walletBalance, available: user.walletBalance - user.reservedBalance, pendingWithdrawals: user.reservedBalance };
+  const [paidDeposits, earnings] = await Promise.all([
+    Deposit.aggregate([{ $match: { userId: user._id, status: 'paid' } }, { $group: { _id: null, total: { $sum: '$amount' } } }]),
+    Entry.aggregate([{ $match: { userId: user._id, type: 'earning' } }, { $group: { _id: null, total: { $sum: '$amount' } } }])
+  ]);
+  const deposited = paidDeposits[0]?.total || 0, available = user.walletBalance - user.reservedBalance;
+  return { balance: user.walletBalance, available, pendingWithdrawals: user.reservedBalance, totalDeposited: deposited, verifiedEarnings: earnings[0]?.total || 0, depositToUnlock: Math.max(0, 650 - deposited), withdrawalGap: Math.max(0, 1250 - available), assessmentsUnlocked: deposited >= 650 };
 }
 app.get('/api/wallet', auth, async (req, res) => res.json(await walletSummary(req.user.id)));
 app.get('/api/wallet/transactions', auth, async (req, res) => res.json(await Entry.find({ userId: req.user.id }).sort({ createdAt: -1 }).limit(50).select('type amount reference note createdAt')));
@@ -130,6 +143,37 @@ app.post('/api/admin/earnings', async (req,res) => {
   try{await session.withTransaction(async()=>{await Entry.create([{userId:user._id,type:'earning',amount,reference:`earning:${workReference}`,note:String(req.body?.note||'Verified paid work').slice(0,160)}],{session});await User.updateOne({_id:user._id},{$inc:{walletBalance:amount}},{session})});res.status(201).json({credited:true,amount,reference:workReference})}
   catch(e){if(e.code===11000)return res.status(409).json({error:'That work reference has already been credited.'});throw e}
   finally{await session.endSession()}
+});
+function adminAuthorized(req) { return !!process.env.ADMIN_TOKEN && req.get('x-admin-token') === process.env.ADMIN_TOKEN; }
+app.get('/api/admin/overview', async (req,res) => {
+  if (!adminAuthorized(req)) return res.sendStatus(401);
+  const page = Math.max(1, Math.min(100000, Number.parseInt(req.query.page, 10) || 1)), pageSize = 50;
+  const [members, memberCount, pendingDeposits] = await Promise.all([
+    User.find().sort({ createdAt: -1 }).skip((page - 1) * pageSize).limit(pageSize).select('name username email phone walletBalance createdAt').lean(),
+    User.countDocuments(),
+    Deposit.find({ status: 'pending' }).sort({ createdAt: 1 }).limit(100).populate('userId', 'name email phone').lean()
+  ]);
+  res.json({ members, memberCount, page, pageSize, pendingDeposits });
+});
+app.post('/api/admin/deposits/:id/approve', async (req,res) => {
+  if (!adminAuthorized(req)) return res.sendStatus(401);
+  const receipt = String(req.body?.receipt || '').trim();
+  if (req.body?.verifiedInHashPay !== true || receipt.length < 4 || receipt.length > 100) return res.status(400).json({ error: 'Verify the successful transaction in HashPay, then provide its M-Pesa receipt/reference.' });
+  const session = await mongoose.startSession();
+  try {
+    await session.withTransaction(async () => {
+      const deposit = await Deposit.findOneAndUpdate({ _id: req.params.id, status: 'pending' }, { $set: { status: 'paid', receipt } }, { new: true, session });
+      if (!deposit) throw Object.assign(new Error('This deposit is no longer pending.'), { status: 409 });
+      const user = await User.updateOne({ _id: deposit.userId }, { $inc: { walletBalance: deposit.amount } }, { session });
+      if (!user.matchedCount) throw Object.assign(new Error('The account for this deposit no longer exists.'), { status: 404 });
+      await Entry.create([{ userId: deposit.userId, type: 'deposit', amount: deposit.amount, reference: `dep:${deposit.reference}`, note: `HashPay-verified M-Pesa deposit · ${receipt}` }], { session });
+    });
+    res.json({ approved: true });
+  } catch (e) {
+    if (e.code === 11000) return res.status(409).json({ error: 'That receipt has already been used.' });
+    if (e.status) return res.status(e.status).json({ error: e.message });
+    throw e;
+  } finally { await session.endSession(); }
 });
 app.get('/api/public/withdrawals/recent', async (_req,res) => {
   const rows=await Withdrawal.find({status:'paid'}).sort({createdAt:-1}).limit(8).select('amount createdAt');
