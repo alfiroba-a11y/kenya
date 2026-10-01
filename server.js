@@ -31,6 +31,14 @@ const attemptSchema = new mongoose.Schema({ userId: { type: mongoose.Schema.Type
 const QuestionAttempt = mongoose.model('QuestionAttempt', attemptSchema);
 
 const authLimit = rateLimit({ windowMs: 15 * 60 * 1000, limit: 20, standardHeaders: true, legacyHeaders: false });
+const configuredAdminEmail = () => String(process.env.ADMIN_EMAIL || 'Kiokok614@gmail.com').trim().toLowerCase();
+function adminAuthorized(req) {
+  try {
+    const token = (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
+    const session = jwt.verify(token, process.env.JWT_SECRET);
+    return session.role === 'admin' && String(session.email || '').toLowerCase() === configuredAdminEmail();
+  } catch { return false; }
+}
 function auth(req, res, next) {
   const token = (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
   try { req.user = jwt.verify(token, process.env.JWT_SECRET); next(); }
@@ -43,7 +51,8 @@ const usernameOk = v => typeof v === 'string' && /^[a-zA-Z0-9_]{3,20}$/.test(v);
 app.get('/api/health', (_req, res) => res.json({ ok: mongoose.connection.readyState === 1, database: 'mongodb' }));
 app.post('/api/auth/register', authLimit, async (req, res) => {
   const { name, phone, password } = req.body || {}, email = String(req.body?.email || '').trim().toLowerCase();
-  if (typeof name !== 'string' || name.trim().length < 2 || name.length > 80 || !emailOk(email) || !phoneOk(phone) || typeof password !== 'string' || password.length < 10) return res.status(400).json({ error: 'Enter your name, a valid email, Kenyan M-Pesa number, and password of at least 10 characters.' });
+  if (typeof name !== 'string' || name.trim().length < 2 || name.length > 80 || !emailOk(email) || !phoneOk(phone) || typeof password !== 'string' || password.length < 6) return res.status(400).json({ error: 'Enter your name, a valid email, Kenyan M-Pesa number, and password of at least 6 characters.' });
+  if (email === configuredAdminEmail()) return res.status(403).json({ error: 'This email is reserved for administrator sign-in.' });
   if (await User.exists({ email })) return res.status(409).json({ error: 'An account already uses this email. Log in or use a different email.' });
   const usernameBase = name.toLowerCase().replace(/[^a-z0-9_]/g, '').slice(0, 14) || 'kaziuser';
   const hash = await bcrypt.hash(password, 12);
@@ -75,7 +84,7 @@ app.patch('/api/profile', auth, async (req,res) => {
 });
 app.patch('/api/profile/password', auth, authLimit, async (req,res) => {
   const current=String(req.body?.currentPassword||''),next=String(req.body?.newPassword||'');
-  if(next.length<10||next.length>128)return res.status(400).json({error:'New password must be 10–128 characters.'});
+  if(next.length<6||next.length>128)return res.status(400).json({error:'New password must be 6–128 characters.'});
   const user=await User.findById(req.user.id);if(!user||!(await bcrypt.compare(current,user.password)))return res.status(400).json({error:'Current password is incorrect.'});
   user.password=await bcrypt.hash(next,12);await user.save();res.json({changed:true,message:'Password updated.'});
 });
@@ -134,8 +143,16 @@ async function walletSummary(userId) {
 }
 app.get('/api/wallet', auth, async (req, res) => res.json(await walletSummary(req.user.id)));
 app.get('/api/wallet/transactions', auth, async (req, res) => res.json(await Entry.find({ userId: req.user.id }).sort({ createdAt: -1 }).limit(50).select('type amount reference note createdAt')));
+app.post('/api/admin/login', authLimit, async (req,res) => {
+  const email = String(req.body?.email || '').trim().toLowerCase(), password = String(req.body?.password || ''), expected = Buffer.from(process.env.ADMIN_PASSWORD || ''), provided = Buffer.from(password);
+  if (!process.env.ADMIN_PASSWORD) return res.status(503).json({ error: 'Administrator password is not configured in Render.' });
+  const passwordMatches = expected.length === provided.length && crypto.timingSafeEqual(expected, provided);
+  if (email !== configuredAdminEmail() || !passwordMatches) return res.status(401).json({ error: 'Administrator email or password is incorrect.' });
+  const adminEmail = configuredAdminEmail();
+  res.json({ token: jwt.sign({ id: 'admin', email: adminEmail, role: 'admin' }, process.env.JWT_SECRET, { expiresIn: '2h' }) });
+});
 app.post('/api/admin/earnings', async (req,res) => {
-  if(!process.env.ADMIN_TOKEN||req.get('x-admin-token')!==process.env.ADMIN_TOKEN)return res.sendStatus(401);
+  if(!adminAuthorized(req))return res.sendStatus(401);
   const email=String(req.body?.email||'').trim().toLowerCase(),amount=Number(req.body?.amount),workReference=String(req.body?.workReference||'').trim();
   if(!emailOk(email)||!Number.isSafeInteger(amount)||amount<1||amount>100000||workReference.length<3||workReference.length>100)return res.status(400).json({error:'Provide a valid user email, amount, and unique work reference.'});
   const user=await User.findOne({email});if(!user)return res.status(404).json({error:'No account matches that email.'});
@@ -144,7 +161,6 @@ app.post('/api/admin/earnings', async (req,res) => {
   catch(e){if(e.code===11000)return res.status(409).json({error:'That work reference has already been credited.'});throw e}
   finally{await session.endSession()}
 });
-function adminAuthorized(req) { return !!process.env.ADMIN_TOKEN && req.get('x-admin-token') === process.env.ADMIN_TOKEN; }
 app.get('/api/admin/overview', async (req,res) => {
   if (!adminAuthorized(req)) return res.sendStatus(401);
   const page = Math.max(1, Math.min(100000, Number.parseInt(req.query.page, 10) || 1)), pageSize = 50;
@@ -255,13 +271,13 @@ app.post('/api/wallet/withdrawals', auth, async (req, res) => {
   res.status(201).json({ id: withdrawal.id, status: withdrawal.status, message: 'Withdrawal request submitted. It will appear as reserved while reviewed.' });
 });
 app.get('/api/admin/withdrawals', async (req, res) => {
-  if (!process.env.ADMIN_TOKEN || req.get('x-admin-token') !== process.env.ADMIN_TOKEN) return res.sendStatus(401);
+  if (!adminAuthorized(req)) return res.sendStatus(401);
   const status = ['pending', 'processing'].includes(req.query.status) ? req.query.status : 'pending';
   const rows = await Withdrawal.find({ status }).sort({ createdAt: 1 }).populate('userId', 'name email').limit(100);
   res.json(rows);
 });
 app.post('/api/admin/withdrawals/:id/reconcile', async (req, res) => {
-  if (!process.env.ADMIN_TOKEN || req.get('x-admin-token') !== process.env.ADMIN_TOKEN) return res.sendStatus(401);
+  if (!adminAuthorized(req)) return res.sendStatus(401);
   const outcome = req.body?.outcome;
   if (!['paid', 'failed'].includes(outcome)) return res.status(400).json({ error: 'Set outcome to paid or failed after checking the HashPay portal.' });
   const session = await mongoose.startSession();
@@ -284,7 +300,7 @@ app.post('/api/admin/withdrawals/:id/reconcile', async (req, res) => {
   finally { await session.endSession(); }
 });
 app.post('/api/admin/withdrawals/:id/pay', async (req, res) => {
-  if (!process.env.ADMIN_TOKEN || req.get('x-admin-token') !== process.env.ADMIN_TOKEN) return res.sendStatus(401);
+  if (!adminAuthorized(req)) return res.sendStatus(401);
   if (!process.env.HASHPAY_API_KEY || !process.env.HASHPAY_SECURITY_CREDENTIAL) return res.status(503).json({ error: 'HashPay B2C credentials are not configured.' });
   const item = await Withdrawal.findOneAndUpdate({ _id: req.params.id, status: 'pending' }, { $set: { status: 'processing' } }, { new: true });
   if (!item) return res.status(409).json({ error: 'Request is unavailable or already being processed.' });

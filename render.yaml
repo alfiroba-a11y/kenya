@@ -11,8 +11,10 @@ services:
         sync: false
       - key: JWT_SECRET
         generateValue: true
-      - key: ADMIN_TOKEN
-        generateValue: true
+      - key: ADMIN_EMAIL
+        value: Kiokok614@gmail.com
+      - key: ADMIN_PASSWORD
+        sync: false
       - key: HASHPAY_ACCOUNT_ID
         sync: false
       - key: HASHPAY_API_KEY
