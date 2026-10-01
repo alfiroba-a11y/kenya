@@ -219,11 +219,12 @@ app.patch('/api/admin/settings', async (req,res) => {
   const settings = await QuizSettings.findOneAndUpdate({ key: 'main' }, { $set: { skillPointsPerCorrect, difficultyMultipliers, updatedAt: new Date() } }, { new: true, upsert: true, runValidators: true });
   res.json({ skillPointsPerCorrect: settings.skillPointsPerCorrect, difficultyMultipliers: settings.difficultyMultipliers });
 });
-app.post('/api/admin/members/:id/adjust', async (req,res) => {
+app.post('/api/admin/members/:id/wallet-transactions', async (req,res) => {
   if (!adminAuthorized(req)) return res.sendStatus(401);
   if (!mongoose.isValidObjectId(req.params.id)) return res.status(404).json({ error: 'Member not found.' });
-  const amount = Number(req.body?.amount), direction = req.body?.direction, reason = String(req.body?.reason || '').trim();
-  if (!Number.isSafeInteger(amount) || amount < 1 || amount > 100000 || !['credit', 'debit'].includes(direction) || reason.length < 8 || reason.length > 180) return res.status(400).json({ error: 'Enter a KES amount, credit or debit, and a reason (8–180 characters).' });
+  const amount = Number(req.body?.amount), action = req.body?.action, reason = String(req.body?.reason || '').trim();
+  if (!Number.isSafeInteger(amount) || amount < 1 || amount > (action === 'withdraw' ? 12000 : 100000) || !['deposit', 'withdraw'].includes(action) || reason.length < 8 || reason.length > 180) return res.status(400).json({ error: 'Choose deposit or withdraw, enter a valid KES amount, and provide a reason (8–180 characters).' });
+  const direction = action === 'deposit' ? 'credit' : 'debit';
   const session = await mongoose.startSession();
   try {
     await session.withTransaction(async () => {
@@ -231,10 +232,10 @@ app.post('/api/admin/members/:id/adjust', async (req,res) => {
       const delta = direction === 'credit' ? amount : -amount;
       const user = await User.findOneAndUpdate(filter, { $inc: { walletBalance: delta } }, { new: true, session });
       if (!user) throw Object.assign(new Error(direction === 'debit' ? 'Member not found or debit exceeds the available balance.' : 'Member not found.'), { status: direction === 'debit' ? 409 : 404 });
-      await Entry.create([{ userId: user._id, type: 'adjustment', amount, direction, reference: `adjust:${crypto.randomUUID()}`, note: reason }], { session });
+      await Entry.create([{ userId: user._id, type: action === 'deposit' ? 'deposit' : 'withdrawal', amount, direction, reference: `admin-${action}:${crypto.randomUUID()}`, note: `Admin-recorded ${action} · ${reason}` }], { session });
       res.locals.adjustedMember = { balance: user.walletBalance, available: user.walletBalance - user.reservedBalance };
     });
-    res.json({ adjusted: true, ...res.locals.adjustedMember });
+    res.json({ recorded: action, ...res.locals.adjustedMember });
   } catch (e) { if (e.status) return res.status(e.status).json({ error: e.message }); throw e; }
   finally { await session.endSession(); }
 });

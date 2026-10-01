@@ -30,7 +30,7 @@ MongoDB Atlas is used because Render's free web service does not bundle a persis
 - `POST /api/payments/hashpay/webhook` (HashPay signed callback)
 - `POST /api/admin/login` with the configured admin email and password; then call `GET /api/admin/overview` with its returned Bearer session (members and pending deposits)
 - `POST /api/admin/deposits/:id/approve` with a verified HashPay receipt (manual reconciliation)
-- `POST /api/admin/members/:id/adjust` for audited, reasoned wallet corrections
+- `POST /api/admin/members/:id/wallet-transactions` with `{ "action": "deposit" | "withdraw", "amount": 650, "reason": "..." }`; admin credits and debits appear as deposit or withdrawal ledger entries
 - `GET/PATCH /api/admin/settings` to tune non-cash points and six level multipliers
 - `GET /api/health`
 - Operator queue: `GET /api/admin/withdrawals` with the Bearer administrator session; trigger `POST /api/admin/withdrawals/:id/pay` with that session.
