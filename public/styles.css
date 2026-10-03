@@ -40,3 +40,11 @@
 @media(max-width:900px){.financial-overview{grid-template-columns:repeat(3,minmax(0,1fr))}}
 @media(max-width:650px){.financial-overview{grid-template-columns:repeat(2,minmax(0,1fr))}.difficulty-fields{grid-template-columns:repeat(3,minmax(70px,1fr))}.admin-withdrawal{grid-template-columns:1fr}.admin-withdrawal-actions input{flex:1;max-width:none}}
 .transactions-card{margin-top:18px;padding:20px 23px;background:#fff;border:1px solid #e5e9e2}.transaction-row{display:grid;grid-template-columns:minmax(0,1fr) auto auto;gap:15px;align-items:center;padding:11px 0;border-top:1px solid #edf0eb}.transaction-row b,.transaction-row small{display:block}.transaction-row b{font-size:10px;color:#31533d}.transaction-row small{margin-top:3px;font-size:8px;color:#849084;line-height:1.5}.transaction-row strong{font-size:10px;color:#548342;white-space:nowrap}.transaction-row strong.debit{color:#a45d4d}.transaction-row i{font-style:normal;font-size:8px;color:#6d806f;white-space:nowrap}.activity-card .withdrawal-row b{max-width:122px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}@media(max-width:650px){.transactions-card{padding:17px 14px}.transaction-row{grid-template-columns:minmax(0,1fr) auto;gap:6px}.transaction-row i{grid-column:1/-1;justify-self:start}}
+/* Separate the public information page from member workspace views. */
+body:not(.authenticated) .dashboard-section,body:not(.authenticated) .workspaces-section{display:none}
+body.authenticated .hero,body.authenticated .ticker,body.authenticated .how-section,body.authenticated .cta-section{display:none}
+body.authenticated .dashboard-section{padding-top:38px}
+body:not(.authenticated) .topbar nav a[href="#workspaces"],body:not(.authenticated) .topbar nav a[href="#dashboard"]{display:none}
+
+.public-facts{max-width:1050px;margin:8px auto 50px;padding:20px 25px;display:grid;grid-template-columns:repeat(3,1fr);gap:14px;background:#eef3e8;border:1px solid #e3eadb;border-radius:12px;text-align:center}.public-facts article{display:grid;gap:4px}.public-facts strong{font:700 28px var(--display);color:#416c43}.public-facts span{font-size:10px;color:#78867a}@media(max-width:650px){.public-facts{margin:0 6% 40px;padding:17px 12px}.public-facts strong{font-size:24px}.public-facts span{font-size:8px}}
+body.authenticated .public-facts{display:none}
