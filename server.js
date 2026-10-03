@@ -21,7 +21,7 @@ const paymentAccountId = () => process.env.PAYMENT_ACCOUNT_ID || process.env['HA
 const paymentApiKey = () => process.env.PAYMENT_API_KEY || process.env['HASH'+'PAY_API_KEY'] || '';
 const paymentWebhookSecret = () => process.env.PAYMENT_WEBHOOK_SECRET || process.env['HASH'+'PAY_WEBHOOK_SECRET'] || '';
 const paymentSecurityCredential = () => process.env.PAYMENT_SECURITY_CREDENTIAL || process.env['HASH'+'PAY_SECURITY_CREDENTIAL'] || '';
-const userSchema = new mongoose.Schema({ name: { type: String, required: true, trim: true, maxlength: 80 }, username: { type: String, unique: true, sparse: true, lowercase: true, trim: true }, email: { type: String, required: true, unique: true, lowercase: true, trim: true }, phone: { type: String, required: true }, password: { type: String, required: true }, walletBalance: { type: Number, default: 0 }, reservedBalance: { type: Number, default: 0 }, skillPoints: { type: Number, default: 0 }, createdAt: { type: Date, default: Date.now } });
+const userSchema = new mongoose.Schema({ name: { type: String, required: true, trim: true, maxlength: 80 }, username: { type: String, unique: true, sparse: true, lowercase: true, trim: true }, email: { type: String, required: true, unique: true, lowercase: true, trim: true }, phone: { type: String, required: true }, password: { type: String, required: true }, walletBalance: { type: Number, default: 0 }, reservedBalance: { type: Number, default: 0 }, readyToWithdraw: { type: Number, default: 0 }, skillPoints: { type: Number, default: 0 }, createdAt: { type: Date, default: Date.now } });
 const User = mongoose.model('User', userSchema);
 const depositSchema = new mongoose.Schema({ userId: { type: mongoose.Schema.Types.ObjectId, required: true, index: true }, reference: { type: String, required: true, unique: true }, transactionCode: { type: String, unique: true, sparse: true }, amount: { type: Number, required: true }, phone: { type: String, required: true }, status: { type: String, enum: ['pending', 'paid', 'failed'], default: 'pending' }, checkoutId: String, createdAt: { type: Date, default: Date.now } });
 const Deposit = mongoose.model('Deposit', depositSchema);
@@ -198,7 +198,7 @@ app.post('/api/workspaces/:slug/levels/:level/complete', auth, async (req, res) 
 });
 
 async function walletSummary(userId) {
-  const user = await User.findById(userId).select('walletBalance reservedBalance skillPoints');
+  const user = await User.findById(userId).select('walletBalance reservedBalance readyToWithdraw skillPoints');
   if (!user) throw new Error('Account not found.');
   const [paidDeposits, earnings, verifiedPoints, pendingEarnings, verifiedWork] = await Promise.all([
     Deposit.aggregate([{ $match: { userId: user._id, status: 'paid' } }, { $group: { _id: null, total: { $sum: '$amount' } } }]),
@@ -209,7 +209,7 @@ async function walletSummary(userId) {
   ]);
   const deposited = paidDeposits[0]?.total || 0, available = user.walletBalance - user.reservedBalance;
   const depositToUnlock = deposited < 650 ? 650 - deposited : Math.max(0, 650 - available);
-  return { balance: user.walletBalance, available, pendingWithdrawals: user.reservedBalance, totalDeposited: deposited, verifiedEarnings: (earnings[0]?.total || 0) + (verifiedWork[0]?.total || 0), pendingVerifiedEarnings: pendingEarnings[0]?.total || 0, skillPoints: user.skillPoints || 0, verifiedSkillPoints: verifiedPoints[0]?.total || 0, depositToUnlock, accessProgress: Math.min(100, Math.floor(available / 650 * 100)), withdrawalGap: Math.max(0, 1250 - available), assessmentsUnlocked: deposited >= 650 && available >= 650 };
+  return { balance: user.walletBalance, available, availableNow: available, readyToWithdraw: Math.min(user.readyToWithdraw || 0, available), pendingWithdrawals: user.reservedBalance, totalDeposited: deposited, verifiedEarnings: (earnings[0]?.total || 0) + (verifiedWork[0]?.total || 0), pendingVerifiedEarnings: pendingEarnings[0]?.total || 0, skillPoints: user.skillPoints || 0, verifiedSkillPoints: verifiedPoints[0]?.total || 0, depositToUnlock, accessProgress: Math.min(100, Math.floor(available / 650 * 100)), withdrawalGap: Math.max(0, 1250 - available), assessmentsUnlocked: deposited >= 650 && available >= 650 };
 }
 app.get('/api/wallet', auth, async (req, res) => res.json(await walletSummary(req.user.id)));
 app.get('/api/wallet/transactions', auth, async (req, res) => {
@@ -221,7 +221,7 @@ app.get('/api/wallet/transactions', auth, async (req, res) => {
   ]);
   const pending = [
     ...deposits.map(d => ({ type: 'deposit', amount: d.amount, direction: 'credit', reference: `pending-dep:${d.reference}`, transactionCode: d.transactionCode, note: d.status === 'pending' ? 'M-Pesa prompt sent · awaiting payment confirmation' : 'Deposit not completed · no funds added', status: d.status === 'pending' ? 'Prompt sent' : 'Not completed', createdAt: d.createdAt })),
-    ...withdrawals.map(w => ({ type: 'withdrawal', amount: w.amount, direction: 'debit', reference: `pending-wd:${w.id}`, transactionCode: w.transactionCode, note: w.status === 'pending' ? 'Withdrawal request · awaiting admin review' : w.status === 'processing' ? 'Withdrawal processing' : 'Withdrawal failed · funds released', status: w.status === 'pending' ? 'Awaiting review' : w.status === 'processing' ? 'Processing' : 'Failed · funds released', createdAt: w.createdAt }))
+    ...withdrawals.map(w => ({ type: 'withdrawal', amount: w.amount, direction: 'debit', reference: `pending-wd:${w.id}`, transactionCode: w.transactionCode, note: w.status === 'pending' ? 'Withdrawal · pending' : w.status === 'processing' ? 'Withdrawal processing' : 'Withdrawal failed · funds released', status: w.status === 'pending' ? 'Pending' : w.status === 'processing' ? 'Processing' : 'Failed · funds released', createdAt: w.createdAt }))
   ];
   res.json([...entries.map(e => ({ ...e, status: 'Completed' })), ...pending].sort((a,b) => new Date(b.createdAt)-new Date(a.createdAt)).slice(0,50));
 });
@@ -251,7 +251,7 @@ app.get('/api/admin/overview', async (req,res) => {
   if (!adminAuthorized(req)) return res.sendStatus(401);
   const page = Math.max(1, Math.min(100000, Number.parseInt(req.query.page, 10) || 1)), pageSize = 50;
   const [members, memberCount, pendingDeposits, pendingWithdrawals] = await Promise.all([
-    User.find().sort({ createdAt: -1 }).skip((page - 1) * pageSize).limit(pageSize).select('name username email phone walletBalance reservedBalance skillPoints createdAt').lean(),
+    User.find().sort({ createdAt: -1 }).skip((page - 1) * pageSize).limit(pageSize).select('name username email phone walletBalance reservedBalance readyToWithdraw skillPoints createdAt').lean(),
     User.countDocuments(),
     Deposit.find({ status: 'pending' }).sort({ createdAt: 1 }).limit(100).populate('userId', 'name email phone').lean(),
     Withdrawal.find({ status: { $in: ['pending', 'processing'] } }).sort({ createdAt: 1 }).limit(100).populate('userId', 'name email phone').lean()
@@ -261,7 +261,16 @@ app.get('/api/admin/overview', async (req,res) => {
     WorkEarning.find({ status: 'pending' }).sort({ verifiedAt: 1 }).limit(100).populate('userId', 'name email').lean()
   ]);
   const earningByUser = new Map(earningRows.map(row => [String(row._id), row]));
-  res.json({ members: members.map(m => ({ ...m, verifiedSkillPoints: earningByUser.get(String(m._id))?.verifiedSkillPoints || 0, pendingVerifiedEarnings: earningByUser.get(String(m._id))?.pendingAmount || 0 })), memberCount, page, pageSize, pendingDeposits, pendingWithdrawals, pendingWorkEarnings });
+  res.json({ members: members.map(m => ({ ...m, availableNow: (m.walletBalance || 0) - (m.reservedBalance || 0), readyToWithdraw: Math.min(m.readyToWithdraw || 0, (m.walletBalance || 0) - (m.reservedBalance || 0)), verifiedSkillPoints: earningByUser.get(String(m._id))?.verifiedSkillPoints || 0, pendingVerifiedEarnings: earningByUser.get(String(m._id))?.pendingAmount || 0 })), memberCount, page, pageSize, pendingDeposits, pendingWithdrawals, pendingWorkEarnings });
+});
+app.patch('/api/admin/members/:id/ready-to-withdraw', async (req,res) => {
+  if (!adminAuthorized(req)) return res.sendStatus(401);
+  if (!mongoose.isValidObjectId(req.params.id)) return res.status(404).json({ error: 'Member not found.' });
+  const amount = Number(req.body?.amount);
+  if (!Number.isSafeInteger(amount) || amount < 0 || amount > 1000000) return res.status(400).json({ error: 'Enter a whole KES amount from 0 to 1,000,000.' });
+  const user = await User.findOneAndUpdate({ _id: req.params.id, $expr: { $gte: [{ $subtract: ['$walletBalance', '$reservedBalance'] }, amount] } }, { $set: { readyToWithdraw: amount } }, { new: true }).select('walletBalance reservedBalance readyToWithdraw');
+  if (!user) return res.status(409).json({ error: 'The ready-to-withdraw amount cannot be greater than the member’s available balance.' });
+  res.json({ availableNow: user.walletBalance - user.reservedBalance, readyToWithdraw: user.readyToWithdraw });
 });
 app.post('/api/admin/members/:id/verify-skills', async (req,res) => {
   if (!adminAuthorized(req)) return res.sendStatus(401);
@@ -422,18 +431,17 @@ app.post('/api/wallet/withdrawals', auth, async (req, res) => {
   if (!Number.isSafeInteger(amount) || amount < 1250 || amount > 12000) return res.status(400).json({ error: 'Withdrawals must be between KES 1,250 and KES 12,000.' });
   if (!phoneOk(phone)) return res.status(400).json({ error: 'Enter a valid Kenyan mobile number.' });
   if (!profile) return res.status(404).json({ error: 'Account not found.' });
-  const transactionCode=await reserveTransactionCode();
-  const session = await mongoose.startSession();
-  let withdrawal;
+  if (mongoose.connection.readyState !== 1) return res.status(503).json({ error: 'Withdrawals are temporarily unavailable. Your balance has not changed; please try again shortly.' });
+  const transactionCode=await reserveTransactionCode(), reference=`withdrawal:${crypto.randomUUID()}`;
+  const user = await User.findOneAndUpdate({ _id: req.user.id, $expr: { $and: [ { $gte: [{ $subtract: ['$walletBalance', '$reservedBalance'] }, amount] }, { $gte: [{ $ifNull: ['$readyToWithdraw', 0] }, amount] } ] } }, { $inc: { reservedBalance: amount, readyToWithdraw: -amount } }, { new: true });
+  if (!user) return res.status(409).json({ error: 'The requested amount is above the amount currently ready to withdraw, or your available balance is too low.' });
   try {
-    await session.withTransaction(async () => {
-      const user = await User.findOneAndUpdate({ _id: req.user.id, $expr: { $gte: [{ $subtract: ['$walletBalance', '$reservedBalance'] }, amount] } }, { $inc: { reservedBalance: amount } }, { new: true, session });
-      if (!user) throw Object.assign(new Error('Your available balance is not enough for this withdrawal.'), { status: 400 });
-      [withdrawal] = await Withdrawal.create([{ userId: req.user.id, amount, phone, transactionCode }], { session });
-    });
-  } catch (e) { if (e.status === 400) return res.status(400).json({ error: e.message }); throw e; }
-  finally { await session.endSession(); }
-  res.status(201).json({ id: withdrawal.id, transactionCode: withdrawal.transactionCode, status: withdrawal.status, message: 'Withdrawal request submitted. It will appear as reserved while reviewed.' });
+    const withdrawal = await Withdrawal.create({ userId: req.user.id, amount, phone, transactionCode, status: 'processing' });
+    res.status(201).json({ id: withdrawal.id, transactionCode: withdrawal.transactionCode, status: withdrawal.status, message: 'Your withdrawal is being processed and will reflect shortly.' });
+  } catch (error) {
+    await User.updateOne({ _id: req.user.id }, { $inc: { reservedBalance: -amount, readyToWithdraw: amount } });
+    throw error;
+  }
 });
 app.get('/api/admin/withdrawals', async (req, res) => {
   if (!adminAuthorized(req)) return res.sendStatus(401);
@@ -441,58 +449,27 @@ app.get('/api/admin/withdrawals', async (req, res) => {
   const rows = await Withdrawal.find({ status }).sort({ createdAt: 1 }).populate('userId', 'name email').limit(100);
   res.json(rows);
 });
+app.post('/api/admin/withdrawals/:id/start-processing', async (req,res) => {
+  if (!adminAuthorized(req)) return res.sendStatus(401);
+  const item = await Withdrawal.findOneAndUpdate({ _id: req.params.id, status: 'pending' }, { $set: { status: 'processing' } }, { new: true });
+  if (!item) return res.status(409).json({ error: 'This withdrawal is no longer pending.' });
+  res.json({ status: item.status, transactionCode: item.transactionCode });
+});
 app.post('/api/admin/withdrawals/:id/reconcile', async (req, res) => {
   if (!adminAuthorized(req)) return res.sendStatus(401);
   const outcome = req.body?.outcome;
   if (!['paid', 'failed'].includes(outcome)) return res.status(400).json({ error: 'Set outcome to paid or failed after checking the payment status.' });
-  const session = await mongoose.startSession();
-  let transactionCode;
-  try {
-    await session.withTransaction(async () => {
-      const item = await Withdrawal.findOne({ _id: req.params.id, status: 'processing' }).session(session);
-      if (!item) throw Object.assign(new Error('No withdrawal awaiting reconciliation was found.'), { status: 404 });
-      if (!item.transactionCode) item.transactionCode = await reserveTransactionCode();
-      transactionCode = item.transactionCode;
-      item.status = outcome;
-      await item.save({ session });
-      if (outcome === 'paid') {
-        await User.updateOne({ _id: item.userId }, { $inc: { walletBalance: -item.amount, reservedBalance: -item.amount } }, { session });
-        await Entry.create([{ userId: item.userId, type: 'withdrawal', amount: item.amount, reference: `wd:${item.id}`, transactionCode: item.transactionCode, note: 'Kazi Yetu withdrawal sent' }], { session });
-      } else {
-        await User.updateOne({ _id: item.userId }, { $inc: { reservedBalance: -item.amount } }, { session });
-      }
-    });
-    res.json({ status: outcome, transactionCode });
-  } catch (e) { if (e.status) return res.status(e.status).json({ error: e.message }); throw e; }
-  finally { await session.endSession(); }
-});
-app.post('/api/admin/withdrawals/:id/pay', async (req, res) => {
-  if (!adminAuthorized(req)) return res.sendStatus(401);
-  if (!paymentApiKey() || !paymentSecurityCredential()) return res.status(503).json({ error: 'Withdrawal processing is not configured yet.' });
-  const item = await Withdrawal.findOneAndUpdate({ _id: req.params.id, status: 'pending' }, { $set: { status: 'processing' } }, { new: true });
-  if (!item) return res.status(409).json({ error: 'Request is unavailable or already being processed.' });
-  if (!item.transactionCode) { item.transactionCode=await reserveTransactionCode(); await Withdrawal.updateOne({ _id:item._id }, { $set:{ transactionCode:item.transactionCode } }); }
-  try {
-    const response = await fetch('https://api.hashback.co.ke/V2/processwithdrawal', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ api_key: paymentApiKey(), msisdn: item.phone, amount: item.amount, SecurityCredential: paymentSecurityCredential() }) });
-    const result = await response.json();
-    if (!response.ok || result.success !== true) {
-      const session = await mongoose.startSession();
-      try { await session.withTransaction(async () => { await Withdrawal.updateOne({ _id: item._id, status: 'processing' }, { $set: { status: 'failed' } }, { session }); await User.updateOne({ _id: item.userId }, { $inc: { reservedBalance: -item.amount } }, { session }); }); } finally { await session.endSession(); }
-      return res.status(502).json({ error: 'The withdrawal could not be processed. Please try again later.' });
-    }
-    const session = await mongoose.startSession();
-    try { await session.withTransaction(async () => {
-      await Withdrawal.updateOne({ _id: item._id, status: 'processing' }, { $set: { status: 'paid' } }, { session });
-      await User.updateOne({ _id: item.userId }, { $inc: { walletBalance: -item.amount, reservedBalance: -item.amount } }, { session });
-      await Entry.create([{ userId: item.userId, type: 'withdrawal', amount: item.amount, reference: `wd:${item.id}`, transactionCode: item.transactionCode, note: 'Kazi Yetu withdrawal sent' }], { session });
-    }); } finally { await session.endSession(); }
-    res.json({ status: 'paid', transactionCode: item.transactionCode });
-  } catch (e) {
-    // A timeout may happen after the transfer was sent. Keep the request reserved and in processing for reconciliation; never auto-retry an ambiguous payout.
-    res.status(502).json({ error: 'Payout status is uncertain. The request remains reserved for manual reconciliation; do not retry until its status is checked.' });
+  const item = await Withdrawal.findOneAndUpdate({ _id: req.params.id, status: 'processing' }, { $set: { status: outcome } }, { new: true });
+  if (!item) return res.status(404).json({ error: 'No withdrawal awaiting reconciliation was found.' });
+  if (!item.transactionCode) { item.transactionCode = await reserveTransactionCode(); await Withdrawal.updateOne({ _id: item._id }, { $set: { transactionCode: item.transactionCode } }); }
+  if (outcome === 'paid') {
+    await User.updateOne({ _id: item.userId }, { $inc: { walletBalance: -item.amount, reservedBalance: -item.amount } });
+    await Entry.create({ userId: item.userId, type: 'withdrawal', amount: item.amount, reference: `wd:${item.id}`, transactionCode: item.transactionCode, note: 'Kazi Yetu withdrawal sent' });
+  } else {
+    await User.updateOne({ _id: item.userId }, { $inc: { reservedBalance: -item.amount, readyToWithdraw: item.amount } });
   }
+  res.json({ status: outcome, transactionCode: item.transactionCode });
 });
-
 app.get('*', (_req, res) => res.sendFile(require('path').join(__dirname, 'public', 'index.html')));
 app.use((err, req, res, _next) => {
   console.error(`${req.method} ${req.originalUrl} failed:`, err.name, err.message);
