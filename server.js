@@ -1,255 +1,470 @@
-import crypto from 'node:crypto';
-import { readFile } from 'node:fs/promises';
-import express from 'express';
-import bcrypt from 'bcryptjs';
-import jwt from 'jsonwebtoken';
-import mongoose from 'mongoose';
-import PDFDocument from 'pdfkit';
-import { HashPayClient, constructWebhookEvent } from '@hashpay.me/sdk';
+require('dotenv').config();
+const crypto = require('crypto');
+require('express-async-errors');
+const express = require('express');
+const mongoose = require('mongoose');
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
+const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
+const { WORKSPACES, LEVELS, getQuestions } = require('./workspaces');
 
-const app = express(); const port = process.env.PORT || 3000; const jwtSecret = process.env.JWT_SECRET; const usdtAddress = 'THESvopuBtMGHnbok39ZUBh2EkV7m4Kwne'; const release = 'xcrow-stable-2026-09-13-9';
-process.on('unhandledRejection', error => console.error('Unhandled XCROW promise rejection:', error));
-process.on('uncaughtException', error => console.error('Uncaught XCROW error:', error));
-// Express 4 does not forward rejected async route handlers by default. Wrap
-// them once so a single database/provider error cannot leave a request hanging
-// or destabilize the process.
-for (const method of ['get', 'post', 'put', 'patch', 'delete']) {
-  const register = app[method].bind(app);
-  app[method] = (...args) => register(...args.map(arg => typeof arg === 'function' && arg.constructor?.name === 'AsyncFunction' ? (req, res, next) => Promise.resolve(arg(req, res, next)).catch(next) : arg));
-}
-const User = mongoose.model('User', new mongoose.Schema({ name: { type: String, required: true, trim: true }, email: { type: String, unique: true, required: true, lowercase: true, trim: true }, passwordHash: { type: String, required: true }, profile: { mpesaNumber: { type: String, default: '' }, mpesaReceiveNumber: { type: String, default: '' }, trc20Address: { type: String, default: '' }, trc20ReceiveAddress: { type: String, default: '' }, binanceId: { type: String, default: '' } } }, { timestamps: true }));
-const Deal = mongoose.model('Deal', new mongoose.Schema({ code: { type: String, unique: true, required: true }, title: String, description: String, amount: Number, currency: { type: String, enum: ['USDT', 'KES'] }, automation: { type: String, enum: ['manual', 'bot'], default: 'manual' }, depositRole: { type: String, enum: ['buyer', 'seller'], default: 'buyer' }, fee: { payer: String, amount: Number, sourceKes: Number, rate: Number, buyerTotal: Number, sellerReceives: Number }, creator: mongoose.Schema.Types.ObjectId, parties: [{ user: mongoose.Schema.Types.ObjectId, name: String, role: { type: String, enum: ['buyer', 'seller', 'third_party'] } }], readyBy: [{ user: mongoose.Schema.Types.ObjectId, role: String, at: Date }], botConfirmedBy: [{ user: mongoose.Schema.Types.ObjectId, role: String, at: Date }], refundAgreedBy: [{ user: mongoose.Schema.Types.ObjectId, role: String, at: Date }], releaseRequestedAt: Date, completedAt: Date, completedBy: mongoose.Schema.Types.ObjectId, closedAt: Date, closeReason: String, finalStatus: String, appealedAt: Date, status: { type: String, default: 'Awaiting participants' }, payments: [{ invoiceId: String, checkoutId: String, checkoutUrl: String, method: String, amount: Number, status: { type: String, default: 'pending' }, paidAt: Date, reference: String }] }, { timestamps: true }));
-const Message = mongoose.model('Message', new mongoose.Schema({ deal: { type: mongoose.Schema.Types.ObjectId, ref: 'Deal', required: true }, sender: mongoose.Schema.Types.ObjectId, senderName: String, body: { type: String, required: true, trim: true, maxlength: 1500 } }, { timestamps: true }));
-const AdminAction = mongoose.model('AdminAction', new mongoose.Schema({ admin: mongoose.Schema.Types.ObjectId, deal: mongoose.Schema.Types.ObjectId, action: String, note: String }, { timestamps: true }));
-const DealFeedback = mongoose.model('DealFeedback', new mongoose.Schema({ deal: { type: mongoose.Schema.Types.ObjectId, ref: 'Deal', required: true }, user: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true }, rating: { type: Number, required: true, min: 1, max: 5 }, comment: { type: String, trim: true, maxlength: 600, default: '' } }, { timestamps: true }));
-const SupportTicket = mongoose.model('SupportTicket', new mongoose.Schema({ user: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true }, userName: String, email: String, messages: [{ sender: String, body: String, at: Date }], status: { type: String, default: 'open' } }, { timestamps: true }));
-const hashpay = process.env.HASHPAY_API_KEY && (process.env.HASHPAY_ORGANIZATION_ID || process.env.HASHPAY_ACCOUNT_ID) ? new HashPayClient({ apiKey: process.env.HASHPAY_API_KEY, organizationId: process.env.HASHPAY_ORGANIZATION_ID || process.env.HASHPAY_ACCOUNT_ID }) : null;
-const mongoUri = String(process.env.MONGO_URI || process.env.MONGODB_URI || '').trim();
-let mongoConnectAttempt = null;
-let mongoRetryTimer = null;
-mongoose.set('bufferCommands', false);
-async function connectDatabase() {
-  if (!mongoUri || mongoose.connection.readyState === 1) return;
-  if (mongoConnectAttempt) return mongoConnectAttempt;
-  mongoConnectAttempt = mongoose.connect(mongoUri, { serverSelectionTimeoutMS: 10000, connectTimeoutMS: 10000 })
-    .then(() => console.log('MongoDB connected'))
-    .catch(error => {
-      console.error('MongoDB connection failed:', error.message);
-      if (!mongoRetryTimer) mongoRetryTimer = setTimeout(() => { mongoRetryTimer = null; connectDatabase(); }, 5000);
-    })
-    .finally(() => { mongoConnectAttempt = null; });
-  return mongoConnectAttempt;
-}
-mongoose.connection.on('disconnected', () => { if (mongoUri && !mongoRetryTimer) mongoRetryTimer = setTimeout(() => { mongoRetryTimer = null; connectDatabase(); }, 1500); });
-connectDatabase();
+const app = express();
+app.set('trust proxy', 1);
+app.use(helmet({ contentSecurityPolicy: { directives: { ...helmet.contentSecurityPolicy.getDefaultDirectives(), "style-src": ["'self'", "https://fonts.googleapis.com"], "style-src-attr": ["'unsafe-inline'"], "font-src": ["'self'", "https://fonts.gstatic.com", "data:"], "connect-src": ["'self'", "https://api.hashback.co.ke"] } } }));
+app.use('/api/payments/callback', express.raw({ type: 'application/json', limit: '32kb' }));
+app.use(express.json({ limit: '20kb' }));
+app.use(express.static('public'));
 
-function validSignature(expected, received) { const a = Buffer.from(expected); const b = Buffer.from(received); return a.length === b.length && crypto.timingSafeEqual(a, b); }
-// This is supplied with every STK request. Keeping it here prevents a
-// HashPay portal setting from silently stopping automatic confirmations.
-const hashbackWebhookUrl = String(process.env.HASHPAY_WEBHOOK_URL || process.env.PUBLIC_BASE_URL || 'https://xcrow.online').replace(/\/$/, '') + '/webhooks/hashpay';
-async function fundPayment(deal, payment, { reference, providerId } = {}) {
-  if (!deal || !payment || payment.status === 'paid') return false;
-  payment.status = 'paid';
-  payment.paidAt = new Date();
-  if (reference) payment.reference = String(reference);
-  if (providerId) payment.invoiceId = String(providerId);
-  deal.status = 'Funded';
-  await deal.save();
-  if (deal.automation === 'bot') await botMessage(deal, `Payment confirmed. ${partyName(deal, 'seller')}, please proceed with “${deal.title}”. ${partyName(deal, 'buyer')}, once you have received it, use Release to continue settlement. If there is an issue, both parties can choose Refund.`);
-  console.info('XCROW payment funded', { deal: deal.code, method: payment.method, reference: payment.reference });
-  return true;
+function makeTransactionCode() { const d = new Date(), day = `${d.getFullYear()}${String(d.getMonth()+1).padStart(2,'0')}${String(d.getDate()).padStart(2,'0')}`; return `KYT-${day}-${crypto.randomBytes(8).toString('hex').toUpperCase()}`; }
+const paymentAccountId = () => process.env.PAYMENT_ACCOUNT_ID || process.env['HASH'+'PAY_ACCOUNT_ID'] || '';
+const paymentApiKey = () => process.env.PAYMENT_API_KEY || process.env['HASH'+'PAY_API_KEY'] || '';
+const paymentWebhookSecret = () => process.env.PAYMENT_WEBHOOK_SECRET || process.env['HASH'+'PAY_WEBHOOK_SECRET'] || '';
+const paymentSecurityCredential = () => process.env.PAYMENT_SECURITY_CREDENTIAL || process.env['HASH'+'PAY_SECURITY_CREDENTIAL'] || '';
+const userSchema = new mongoose.Schema({ name: { type: String, required: true, trim: true, maxlength: 80 }, username: { type: String, unique: true, sparse: true, lowercase: true, trim: true }, email: { type: String, required: true, unique: true, lowercase: true, trim: true }, phone: { type: String, required: true }, password: { type: String, required: true }, walletBalance: { type: Number, default: 0 }, reservedBalance: { type: Number, default: 0 }, skillPoints: { type: Number, default: 0 }, createdAt: { type: Date, default: Date.now } });
+const User = mongoose.model('User', userSchema);
+const depositSchema = new mongoose.Schema({ userId: { type: mongoose.Schema.Types.ObjectId, required: true, index: true }, reference: { type: String, required: true, unique: true }, transactionCode: { type: String, unique: true, sparse: true }, amount: { type: Number, required: true }, phone: { type: String, required: true }, status: { type: String, enum: ['pending', 'paid', 'failed'], default: 'pending' }, checkoutId: String, createdAt: { type: Date, default: Date.now } });
+const Deposit = mongoose.model('Deposit', depositSchema);
+const withdrawalSchema = new mongoose.Schema({ userId: { type: mongoose.Schema.Types.ObjectId, required: true, index: true }, transactionCode: { type: String, unique: true, sparse: true }, amount: { type: Number, required: true }, phone: { type: String, required: true }, status: { type: String, enum: ['pending', 'processing', 'paid', 'failed'], default: 'pending' }, createdAt: { type: Date, default: Date.now } });
+const Withdrawal = mongoose.model('Withdrawal', withdrawalSchema);
+const entrySchema = new mongoose.Schema({ userId: { type: mongoose.Schema.Types.ObjectId, required: true, index: true }, type: { type: String, enum: ['deposit', 'earning', 'withdrawal', 'adjustment'], required: true }, transactionCode: { type: String, unique: true, sparse: true }, amount: { type: Number, required: true }, direction: { type: String, enum: ['credit', 'debit'] }, reference: { type: String, required: true, unique: true }, note: String, createdAt: { type: Date, default: Date.now } });
+const Entry = mongoose.model('Entry', entrySchema);
+const transactionCodeSchema = new mongoose.Schema({ code: { type: String, unique: true, required: true }, createdAt: { type: Date, default: Date.now } });
+const TransactionCode = mongoose.model('TransactionCode', transactionCodeSchema);
+async function reserveTransactionCode() {
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const code = makeTransactionCode();
+    try { await TransactionCode.create({ code }); return code; }
+    catch (error) { if (error.code !== 11000) throw error; }
+  }
+  throw new Error('Could not allocate a unique transaction code. Try again.');
 }
-const partyName = (deal, role) => deal.parties.find(item => item.role === role)?.name || (role === 'buyer' ? 'Buyer' : 'Seller');
-const botMessage = (deal, body) => Message.create({ deal: deal.id, senderName: 'Automated XCROW Bot', body: String(body).replace(/([.!?])\s+/g, '$1\n') });
-async function beginAutomatedDeposit(deal) {
-  if (deal.automation !== 'bot' || deal.status !== 'Bot confirmation required') return;
-  const buyer = deal.parties.find(item => item.role === 'buyer');
-  if (!buyer) return;
-  const total = deal.fee.buyerTotal;
-  if (deal.currency === 'USDT') { deal.status = 'Ready to deposit'; await deal.save(); await botMessage(deal, `${partyName(deal, 'buyer')}, send exactly ${Number(total).toLocaleString()} USDT through TRC20 using the displayed wallet and QR code. Your deposit will move to funded after secure network verification.`); return; }
-  const buyerAccount = await User.findById(buyer.user);
-  if (!buyerAccount?.profile?.mpesaNumber) { deal.status = 'Ready to deposit'; await deal.save(); await botMessage(deal, `${partyName(deal, 'buyer')}, save your M-Pesa number in Wallet, then press Deposit to receive the secure prompt for ${Number(total).toLocaleString()} KES.`); return; }
-  if (!process.env.HASHPAY_ACCOUNT_ID || !process.env.HASHPAY_API_KEY) { deal.status = 'Ready to deposit'; await deal.save(); await botMessage(deal, `Automated deposit is ready, but the payment provider is unavailable. ${partyName(deal, 'buyer')} can retry from the Deposit button.`); return; }
-  try { const reference = `XCROW-${deal.code}-${Date.now()}`; const stk = await sendStk({ amount: total, phone: buyerAccount.profile.mpesaNumber, reference }); deal.payments.push({ method: 'KES_STK', amount: total, status: 'pending', reference, checkoutId: stk.checkout_id }); deal.status = 'Deposit prompt sent'; await deal.save(); await botMessage(deal, `${partyName(deal, 'buyer')}, a secure M-Pesa prompt for ${Number(total).toLocaleString()} KES has been sent to your saved number. Approve it to continue.`); } catch (error) { deal.status = 'Ready to deposit'; await deal.save(); await botMessage(deal, `The automatic payment prompt could not be sent. ${partyName(deal, 'buyer')} can use Deposit to retry after checking Wallet settings.`); }
+async function backfillTransactionCodes() {
+  for (const deposit of await Deposit.find({ transactionCode: { $exists: false } }).select('_id reference').lean()) {
+    const code = await reserveTransactionCode();
+    await Deposit.updateOne({ _id: deposit._id, transactionCode: { $exists: false } }, { $set: { transactionCode: code } });
+    const saved = await Deposit.findById(deposit._id).select('transactionCode').lean();
+    if (saved?.transactionCode) await Entry.updateOne({ reference: `dep:${deposit.reference}`, transactionCode: { $exists: false } }, { $set: { transactionCode: saved.transactionCode } });
+  }
+  for (const withdrawal of await Withdrawal.find({ transactionCode: { $exists: false } }).select('_id').lean()) {
+    const code = await reserveTransactionCode();
+    await Withdrawal.updateOne({ _id: withdrawal._id, transactionCode: { $exists: false } }, { $set: { transactionCode: code } });
+    const saved = await Withdrawal.findById(withdrawal._id).select('transactionCode').lean();
+    if (saved?.transactionCode) await Entry.updateOne({ reference: `wd:${withdrawal._id}`, transactionCode: { $exists: false } }, { $set: { transactionCode: saved.transactionCode } });
+  }
+  for (const entry of await Entry.find({ transactionCode: { $exists: false } }).select('_id').lean()) {
+    await Entry.updateOne({ _id: entry._id, transactionCode: { $exists: false } }, { $set: { transactionCode: await reserveTransactionCode() } });
+  }
 }
-// Browser clients can safely use the Render origin as a fallback when a custom
-// domain/proxy drops a request. Authentication uses bearer tokens, not cookies.
-const publicOrigins = new Set(['https://xcrow.online', 'https://www.xcrow.online', 'https://www.xcrow.com']);
-app.use((req, res, next) => { const origin = req.get('Origin'); if (origin && publicOrigins.has(origin)) res.setHeader('Access-Control-Allow-Origin', origin); res.setHeader('Vary', 'Origin'); res.setHeader('Access-Control-Allow-Headers', 'Authorization, Content-Type'); res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS'); if (req.method === 'OPTIONS') return res.sendStatus(204); next(); });
-// Log before body parsing. This records every inbound API request without ever
-// logging passwords, tokens, or request bodies.
-app.use((req, res, next) => { const startedAt = Date.now(); let finished = false; res.on('finish', () => { finished = true; console.info(`HTTP ${req.method} ${req.path} ${res.statusCode} ${Date.now() - startedAt}ms`); }); res.on('close', () => { if (!finished) console.warn(`HTTP closed before response ${req.method} ${req.path}`); }); next(); });
-app.post('/webhooks/hashpay', express.raw({ type: '*/*' }), async (req, res) => {
+const progressSchema = new mongoose.Schema({ userId: { type: mongoose.Schema.Types.ObjectId, required: true, index: true }, workspace: { type: String, required: true }, levels: { type: [{ level: Number, completed: Boolean, score: Number, points: Number, completedAt: Date }], default: [] }, updatedAt: { type: Date, default: Date.now } });
+progressSchema.index({ userId: 1, workspace: 1 }, { unique: true });
+const Progress = mongoose.model('Progress', progressSchema);
+const attemptSchema = new mongoose.Schema({ userId: { type: mongoose.Schema.Types.ObjectId, required: true, index: true }, workspace: { type: String, required: true }, level: { type: Number, required: true }, answers: [{ questionId: String, correctChoice: Number }], usedAt: Date, expiresAt: { type: Date, expires: 0 } });
+const QuestionAttempt = mongoose.model('QuestionAttempt', attemptSchema);
+const quizSettingsSchema = new mongoose.Schema({ key: { type: String, unique: true, default: 'main' }, skillPointsPerCorrect: { type: Number, default: 20 }, difficultyMultipliers: { type: [Number], default: [1, 1.25, 1.5, 1.75, 2, 2.5] }, updatedAt: { type: Date, default: Date.now } });
+const QuizSettings = mongoose.model('QuizSettings', quizSettingsSchema);
+
+const authLimit = rateLimit({ windowMs: 15 * 60 * 1000, limit: 20, standardHeaders: true, legacyHeaders: false });
+const configuredAdminEmail = () => String(process.env.ADMIN_EMAIL || 'Kiokok614@gmail.com').trim().toLowerCase();
+const adminPortalPath = () => {
+  // Keep a valid fallback so a missing Render env var never prevents the service
+  // from booting. Admin API access still requires the configured admin login.
+  const path = String(process.env.ADMIN_PATH || '/kz-control-7c91e6d204f5b8a14c3d2e60');
+  if (!/^\/kz-control-[a-z0-9-]{12,80}$/i.test(path)) return '/kz-control-7c91e6d204f5b8a14c3d2e60';
+  return path;
+};
+function adminAuthorized(req) {
   try {
-    const raw = req.body;
-    const signature = req.get('X-HashPay-Signature') || '';
-    if (signature.startsWith('sha256=')) {
-      const expected = `sha256=${crypto.createHmac('sha256', process.env.HASHPAY_WEBHOOK_SECRET || '').update(raw).digest('hex')}`;
-      if (!validSignature(expected, signature)) return res.status(401).send('Invalid signature');
-      const payload = JSON.parse(raw.toString('utf8'));
-      if (payload.event === 'payment.success' && Number(payload.ResponseCode) === 0) {
-        const reference = String(payload.TransactionReference || '');
-        const deal = await Deal.findOne({ 'payments.reference': reference });
-        const payment = deal?.payments.find(item => item.reference === reference);
-        if (payment && Number(payment.amount) === Number(payload.TransactionAmount)) {
-          await fundPayment(deal, payment, { reference, providerId: payload.TransactionID || payload.CheckoutRequestID });
-        } else console.warn('HashPay webhook did not match a pending XCROW payment', { reference, amount: payload.TransactionAmount });
-      }
-      return res.sendStatus(200);
-    }
-    const event = constructWebhookEvent(raw.toString('utf8'), signature, process.env.HASHPAY_WEBHOOK_SECRET);
-    const invoiceId = event.data?.invoiceId || event.data?.id || event.data?.invoice?.id;
-    if (event.type === 'invoice.paid' && invoiceId) {
-      const deal = await Deal.findOne({ 'payments.invoiceId': invoiceId });
-      const payment = deal?.payments.find(item => item.invoiceId === invoiceId);
-      if (payment) await fundPayment(deal, payment, { reference: event.data?.transactionHash || event.data?.paymentId || invoiceId, providerId: invoiceId });
-    }
-    return res.sendStatus(204);
-  } catch (error) {
-    console.error('HashPay webhook rejected:', error.message);
-    return res.status(400).send('Invalid webhook signature');
-  }
-});
-app.use(express.json());
-app.set('etag', false);
-app.use('/api', (_req, res, next) => { res.set('Cache-Control', 'no-store, no-cache, must-revalidate, private'); res.set('Pragma', 'no-cache'); next(); });
-app.get('/app.js', async (_req, res, next) => { try { const [core, adminUi] = await Promise.all([readFile('public/app.js', 'utf8'), readFile('public/admin-dashboard.js', 'utf8')]); res.set('Cache-Control', 'no-store').type('application/javascript').send(`${core}\n${adminUi}`); } catch (error) { next(error); } });
-app.use(express.static('public', { setHeaders: (res, file) => { if (file.endsWith('.html') || file.endsWith('.js')) res.set('Cache-Control', 'no-store'); } }));
-async function requireDatabase(_req, res, next) {
-  if (mongoose.connection.readyState !== 1) {
-    const timeout = new Promise(resolve => setTimeout(resolve, 8000));
-    await Promise.race([connectDatabase(), timeout]);
-  }
-  if (mongoose.connection.readyState !== 1) return res.status(503).json({ error: 'XCROW is reconnecting to its secure database. Please retry in a few seconds.' });
-  next();
+    const token = (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
+    const session = jwt.verify(token, process.env.JWT_SECRET);
+    return session.role === 'admin' && String(session.email || '').toLowerCase() === configuredAdminEmail();
+  } catch { return false; }
 }
-function adminEmails() { return String(process.env.ADMIN_EMAILS || '').toLowerCase().split(',').map(item => item.trim()).filter(Boolean); }
-function safeEqual(left, right) { const a = Buffer.from(String(left)); const b = Buffer.from(String(right)); return a.length === b.length && crypto.timingSafeEqual(a, b); }
-function auth(req, res, next) { try { const token = req.get('Authorization')?.replace('Bearer ', ''); if (!token || !jwtSecret) throw new Error(); const payload = jwt.verify(token, jwtSecret); if (payload.sv !== 1) throw new Error(); req.user = payload; next(); } catch { res.status(401).json({ error: 'Your session has expired. Please log in again.' }); } }
-async function admin(req, res, next) { const user = await User.findById(req.user.id); if (!req.user.admin || !user || !adminEmails().includes(user.email)) return res.status(403).json({ error: 'Administrator access is required.' }); req.adminUser = user; next(); }
-function isMember(deal, id) { return deal.parties.some(p => String(p.user) === id); }
-function myRole(deal, id) { return deal.parties.find(p => String(p.user) === id)?.role; }
-function code() { return Array.from({ length: 5 }, () => 'ABCDEFGHJKLMNPQRSTUVWXYZ'[crypto.randomInt(24)]).join(''); }
-function publicDeal(deal) { const value = deal.toObject(); if (value.status === 'Completed') value.status = 'Released'; return { ...value, thirdPartyInvite: `/join/${value.code}/third_party` }; }
-async function closeEscrow(deal, reason, finalStatus = '') {
-  deal.status = 'Closed';
-  deal.closeReason = reason;
-  if (finalStatus) deal.finalStatus = finalStatus;
-  deal.closedAt = new Date();
-  await deal.save();
-  return deal;
+function auth(req, res, next) {
+  const token = (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
+  try { req.user = jwt.verify(token, process.env.JWT_SECRET); next(); }
+  catch { res.status(401).json({ error: 'Please sign in to continue.' }); }
 }
-async function closeInactiveEscrows() {
-  if (mongoose.connection.readyState !== 1) return;
-  const cutoff = new Date(Date.now() - 60 * 60 * 1000);
-  const inactive = await Deal.find({ status: { $in: ['Awaiting participants', 'Awaiting both confirmations', 'Ready to deposit'] }, updatedAt: { $lte: cutoff }, payments: { $size: 0 } }).limit(100);
-  for (const deal of inactive) {
-    await closeEscrow(deal, 'Timed out: no party joined or no deposit was made within one hour. Please open a new escrow.');
-    console.info('XCROW inactive escrow closed', { deal: deal.code });
-  }
-  const settled = await Deal.find({ status: { $in: ['Released', 'Refunded'] } }).limit(100);
-  for (const deal of settled) await closeEscrow(deal, 'This escrow transaction has finished.', deal.status);
-}
-function feeInKes(amountKes) { if (amountKes < 2000) return 0; if (amountKes < 8000) return 200; if (amountKes < 16000) return 400; if (amountKes < 26000) return 700; if (amountKes < 35000) return 1000; if (amountKes < 47000) return 1500; if (amountKes < 58000) return 2000; if (amountKes < 71000) return 2500; if (amountKes < 91000) return 3000; if (amountKes < 130000) return 4000; if (amountKes <= 200000) return 5000; return 7000; }
-function feeFor(amount, currency, payer) { const rate = Number(process.env.USD_KES_RATE || 130); const sourceKes = feeInKes(currency === 'USDT' ? amount * rate : amount); const fee = currency === 'USDT' ? Number((sourceKes / rate).toFixed(2)) : sourceKes; return { payer, amount: fee, sourceKes, rate, buyerTotal: Number((amount + (payer === 'buyer' ? fee : payer === 'both' ? fee / 2 : 0)).toFixed(2)), sellerReceives: Number((amount - (payer === 'seller' ? fee : payer === 'both' ? fee / 2 : 0)).toFixed(2)) }; }
-function normalizeMpesaNumber(value) { const digits = String(value || '').replace(/\D/g, ''); if (/^0[17]\d{8}$/.test(digits)) return `254${digits.slice(1)}`; if (/^[17]\d{8}$/.test(digits)) return `254${digits}`; if (/^254[17]\d{8}$/.test(digits)) return digits; return ''; }
-async function sendStk({ amount, phone, reference }) { const msisdn = normalizeMpesaNumber(phone); if (!msisdn) throw new Error('Save a valid Kenyan M-Pesa number in Wallet, for example 0712345678.'); const response = await fetch('https://api.hashback.co.ke/initiatestk', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ api_key: process.env.HASHPAY_API_KEY, account_id: process.env.HASHPAY_ACCOUNT_ID, amount: String(amount), msisdn, reference, callback_webhook: hashbackWebhookUrl }) }); const data = await response.json().catch(() => ({})); const accepted = data.success === true || data.success === 'true' || Number(data.ResponseCode) === 0 || String(data.status || '').toLowerCase() === 'success'; if (!response.ok || !accepted) { console.error('HashPay STK rejected', { reference, status: response.status, message: data.message || data.ResponseDescription || 'No provider message' }); throw new Error(data.message || data.ResponseDescription || 'HashPay did not accept the STK request. Check your HashPay account settings.'); } console.info('HashPay STK accepted', { reference, status: response.status, checkoutId: data.checkout_id || data.CheckoutRequestID || null, webhook: hashbackWebhookUrl }); return data; }
-async function reconcilePendingStkPayments() {
-  if (mongoose.connection.readyState !== 1 || !process.env.HASHPAY_API_KEY || !process.env.HASHPAY_ACCOUNT_ID) return;
-  const deals = await Deal.find({ status: { $in: ['Deposit prompt sent', 'Deposit prompt resent'] }, payments: { $elemMatch: { method: 'KES_STK', status: 'pending', checkoutId: { $exists: true, $ne: '' } } } }).limit(20);
-  for (const deal of deals) {
-    const payment = deal.payments.find(item => item.method === 'KES_STK' && item.status === 'pending' && item.checkoutId);
-    if (!payment) continue;
+const emailOk = v => typeof v === 'string' && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v) && v.length <= 200;
+const phoneOk = v => /^(?:\+?254|0)(?:7|1)\d{8}$/.test(String(v || '').replace(/[\s-]/g, ''));
+const usernameOk = v => typeof v === 'string' && /^[a-zA-Z0-9_]{3,20}$/.test(v);
+
+app.get('/api/health', (_req, res) => res.json({ ok: mongoose.connection.readyState === 1, database: 'mongodb' }));
+app.post('/api/auth/register', authLimit, async (req, res) => {
+  const { name, phone, password } = req.body || {}, email = String(req.body?.email || '').trim().toLowerCase();
+  if (typeof name !== 'string' || name.trim().length < 2 || name.length > 80 || !emailOk(email) || !phoneOk(phone) || typeof password !== 'string' || password.length < 6) return res.status(400).json({ error: 'Enter your name, a valid email, Kenyan M-Pesa number, and password of at least 6 characters.' });
+  if (email === configuredAdminEmail()) return res.status(403).json({ error: 'This email is reserved for administrator sign-in.' });
+  if (await User.exists({ email })) return res.status(409).json({ error: 'An account already uses this email. Log in or use a different email.' });
+  const usernameBase = name.toLowerCase().replace(/[^a-z0-9_]/g, '').slice(0, 14) || 'kaziuser';
+  const hash = await bcrypt.hash(password, 12);
+  for (let attempt = 0; attempt < 5; attempt++) {
     try {
-      const response = await fetch('https://api.hashback.co.ke/transactionstatus', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ api_key: process.env.HASHPAY_API_KEY, account_id: process.env.HASHPAY_ACCOUNT_ID, checkoutid: payment.checkoutId }) });
-      const result = await response.json().catch(() => ({}));
-      const completed = response.ok && Number(result.ResultCode) === 0 && /processed successfully/i.test(String(result.ResultDesc || result.ResponseDescription || ''));
-      if (completed) await fundPayment(deal, payment, { reference: payment.reference, providerId: payment.checkoutId });
-    } catch (error) { console.warn('HashPay STK reconciliation failed', { deal: deal.code, message: error.message }); }
+      const user = await User.create({ name: name.trim(), username: `${usernameBase}_${crypto.randomInt(1000,9999)}`, email, phone: normalizePhone(phone), password: hash });
+      return res.status(201).json(issueToken(user));
+    } catch (e) {
+      if (e.code !== 11000) throw e;
+      if (e.keyPattern?.email || await User.exists({ email })) return res.status(409).json({ error: 'An account already uses this email. Log in or use a different email.' });
+      if (!e.keyPattern?.username) throw e;
+    }
   }
+  res.status(503).json({ error: 'We could not finish creating your account. Please try again.' });
+});
+app.post('/api/auth/login', authLimit, async (req, res) => {
+  const email = String(req.body?.email || '').toLowerCase().trim(), password = req.body?.password;
+  if (!emailOk(email) || typeof password !== 'string' || password.length < 6 || password.length > 128) return res.status(400).json({ error: 'Enter a valid email and a password of at least 6 characters.' });
+  if (email === configuredAdminEmail()) return res.status(403).json({ error: 'This is the administrator email. Open your private admin portal to sign in.' });
+  if (mongoose.connection.readyState !== 1) return res.status(503).json({ error: 'Sign-in is temporarily unavailable while the member database reconnects. Please try again shortly.' });
+  try {
+    const user = await User.findOne({ email });
+    if (!user || typeof user.password !== 'string' || !/^\$2[aby]\$\d{2}\$[./A-Za-z0-9]{53}$/.test(user.password)) return res.status(401).json({ error: 'Email or password is incorrect. If this is your account, contact support to restore access.' });
+    const passwordMatches = await bcrypt.compare(password, user.password);
+    if (!passwordMatches) return res.status(401).json({ error: 'Email or password is incorrect.' });
+    res.json(issueToken(user));
+  } catch (error) {
+    console.error('Member login could not query MongoDB:', error.name, error.message);
+    res.status(503).json({ error: 'Sign-in is temporarily unavailable while the member database reconnects. Please try again shortly.' });
+  }
+});
+function issueToken(user) { return { token: jwt.sign({ id: user.id, name: user.name, email: user.email }, process.env.JWT_SECRET, { expiresIn: '7d' }), user: { name: user.name, username: user.username, email: user.email } }; }
+app.get('/api/me', auth, async (req, res) => { const user = await User.findById(req.user.id).select('name username email phone'); if (!user) return res.status(404).json({ error: 'Account not found.' }); res.json({ user }); });
+app.patch('/api/profile', auth, async (req,res) => {
+  const name=String(req.body?.name||'').trim(),username=String(req.body?.username||'').trim().toLowerCase();
+  if(name.length<2||name.length>80||!usernameOk(username))return res.status(400).json({error:'Enter a name (2–80 characters) and username (3–20 letters, numbers, or underscores).'});
+  try{const user=await User.findByIdAndUpdate(req.user.id,{$set:{name,username}},{new:true,runValidators:true}).select('name username email phone');res.json({user})}
+  catch(e){if(e.code===11000)return res.status(409).json({error:'That username is already in use.'});throw e}
+});
+app.patch('/api/profile/password', auth, authLimit, async (req,res) => {
+  const current=String(req.body?.currentPassword||''),next=String(req.body?.newPassword||'');
+  if(next.length<6||next.length>128)return res.status(400).json({error:'New password must be 6–128 characters.'});
+  const user=await User.findById(req.user.id);if(!user||!(await bcrypt.compare(current,user.password)))return res.status(400).json({error:'Current password is incorrect.'});
+  user.password=await bcrypt.hash(next,12);await user.save();res.json({changed:true,message:'Password updated.'});
+});
+
+app.get('/api/workspaces', async (_req, res) => res.json({ workspaces: WORKSPACES, levels: LEVELS }));
+const DEFAULT_QUIZ_SETTINGS = { skillPointsPerCorrect: 20, difficultyMultipliers: [1, 1.25, 1.5, 1.75, 2, 2.5] };
+async function getQuizSettings(session) {
+  let query = QuizSettings.findOne({ key: 'main' });
+  if (session) query = query.session(session);
+  const settings = await query.lean();
+  return settings || DEFAULT_QUIZ_SETTINGS;
 }
-app.post('/api/fees', (req, res) => { const { amount, currency, payer } = req.body || {}; if (!Number(amount) || !['USDT', 'KES'].includes(currency) || !['buyer', 'seller', 'both'].includes(payer)) return res.status(400).json({ error: 'Enter a valid amount and fee choice.' }); res.json(feeFor(Number(amount), currency, payer)); });
-app.post('/api/auth/signup', requireDatabase, async (req, res) => { const { name, email, password } = req.body || {}; const normalizedEmail = String(email || '').toLowerCase().trim(); if (!name || !/^\S+@\S+\.\S+$/.test(normalizedEmail) || String(password).length < 8) return res.status(400).json({ error: 'Enter your name, a valid email, and a password of at least 8 characters.' }); if (!jwtSecret) return res.status(503).json({ error: 'XCROW account creation is not configured. Set JWT_SECRET in Render and redeploy.' }); if (adminEmails().includes(normalizedEmail)) return res.status(403).json({ error: 'This email is reserved for the protected XCROW administrator portal.' }); try { const user = await User.create({ name: String(name).trim(), email: normalizedEmail, passwordHash: await bcrypt.hash(password, 12) }); const token = jwt.sign({ id: user.id, name: user.name, admin: false, sv: 1 }, jwtSecret, { expiresIn: '7d' }); res.status(201).json({ token, user: { id: user.id, name: user.name, email: user.email, admin: false } }); } catch (error) { if (error?.code === 11000) return res.status(409).json({ error: 'An account already exists with this email. Please log in instead.' }); console.error('Signup failed:', error.message); res.status(503).json({ error: 'XCROW could not create the account right now. Please retry shortly.' }); } });
-app.post('/api/auth/login', requireDatabase, async (req, res) => { try { const email = String(req.body?.email || '').toLowerCase().trim(); const password = String(req.body?.password || ''); if (adminEmails().includes(email)) return res.status(403).json({ error: 'This account must sign in through the protected XCROW administrator portal.' }); const user = await User.findOne({ email }); if (!user || !password || !await bcrypt.compare(password, user.passwordHash)) return res.status(401).json({ error: 'No account matches that email and password. Create an account first.' }); if (!jwtSecret) return res.status(503).json({ error: 'XCROW sign-in is not configured. Set JWT_SECRET in Render and redeploy.' }); const token = jwt.sign({ id: user.id, name: user.name, admin: false, sv: 1 }, jwtSecret, { expiresIn: '7d' }); res.json({ token, user: { id: user.id, name: user.name, email: user.email, admin: false } }); } catch (error) { console.error('Login failed:', error.message); res.status(503).json({ error: 'XCROW could not reach the account service. Please retry shortly.' }); } });
-app.post('/api/auth/admin-login', requireDatabase, async (req, res) => { try { const email = String(req.body?.email || '').toLowerCase().trim(); const password = String(req.body?.password || ''); const configuredPassword = String(process.env.ADMIN_PASSWORD || ''); if (!configuredPassword) return res.status(503).json({ error: 'Set ADMIN_PASSWORD in Render, save it, then redeploy the service.' }); if (!adminEmails().includes(email) || !safeEqual(password, configuredPassword)) return res.status(401).json({ error: 'Incorrect administrator email or password.' }); if (!jwtSecret) return res.status(503).json({ error: 'XCROW sign-in is not configured. Set JWT_SECRET in Render and redeploy.' }); let user = await User.findOne({ email }); if (!user) user = await User.create({ name: process.env.ADMIN_NAME || 'XCROW Administrator', email, passwordHash: await bcrypt.hash(configuredPassword, 12) }); const token = jwt.sign({ id: user.id, name: user.name, admin: true, sv: 1 }, jwtSecret, { expiresIn: '7d' }); res.json({ token, user: { id: user.id, name: user.name, email: user.email, admin: true } }); } catch (error) { console.error('Administrator login failed:', error.message); res.status(503).json({ error: 'XCROW could not reach the administrator account service. Please retry shortly.' }); } });
-app.get('/api/auth/me', requireDatabase, auth, async (req, res) => { const user = await User.findById(req.user.id); if (!user) return res.status(401).json({ error: 'Please log in again.' }); res.json({ user: { id: user.id, name: user.name, email: user.email, admin: Boolean(req.user.admin && adminEmails().includes(user.email)) } }); });
-app.get('/api/profile', requireDatabase, auth, async (req, res) => { const user = await User.findById(req.user.id); res.json({ name: user.name, email: user.email, profile: user.profile || {} }); });
-app.put('/api/profile', requireDatabase, auth, async (req, res) => { const profile = req.body?.profile || {}; const suppliedNumber = String(profile.mpesaNumber || ''); const suppliedReceiveNumber = String(profile.mpesaReceiveNumber || ''); const mpesaNumber = suppliedNumber ? normalizeMpesaNumber(suppliedNumber) : ''; const mpesaReceiveNumber = suppliedReceiveNumber ? normalizeMpesaNumber(suppliedReceiveNumber) : ''; if (suppliedNumber && !mpesaNumber) return res.status(400).json({ error: 'Enter a valid Kenyan M-Pesa payment number, for example 0712345678.' }); if (suppliedReceiveNumber && !mpesaReceiveNumber) return res.status(400).json({ error: 'Enter a valid Kenyan M-Pesa receiving number, for example 0712345678.' }); const user = await User.findByIdAndUpdate(req.user.id, { profile: { mpesaNumber, mpesaReceiveNumber, trc20Address: String(profile.trc20Address || '').trim(), trc20ReceiveAddress: String(profile.trc20ReceiveAddress || '').trim(), binanceId: String(profile.binanceId || '').trim() } }, { new: true }); res.json({ name: user.name, email: user.email, profile: user.profile }); });
-app.put('/api/profile/account', requireDatabase, auth, async (req, res) => { const name = String(req.body?.name || '').trim(); if (name.length < 2 || name.length > 80) return res.status(400).json({ error: 'Enter a name between 2 and 80 characters.' }); const user = await User.findByIdAndUpdate(req.user.id, { name }, { new: true }); res.json({ name: user.name, email: user.email, profile: user.profile }); });
-app.get('/api/deals', requireDatabase, auth, async (req, res) => res.json((await Deal.find({ 'parties.user': req.user.id }).sort({ updatedAt: -1 })).map(publicDeal)));
-app.post('/api/deals', requireDatabase, auth, async (req, res) => { const { title, description, amount, currency, creatorRole, feePayer, depositRole, automation = 'manual' } = req.body || {}; if (!title || !description || !Number(amount) || !['USDT', 'KES'].includes(currency) || !['buyer', 'seller'].includes(creatorRole) || !['buyer', 'seller'].includes(depositRole) || !['buyer', 'seller', 'both'].includes(feePayer) || !['manual', 'bot'].includes(automation)) return res.status(400).json({ error: 'Complete every deal field.' }); let dealCode = code(); while (await Deal.exists({ code: dealCode })) dealCode = code(); const deal = await Deal.create({ code: dealCode, title, description, amount: Number(amount), currency, automation, depositRole: automation === 'bot' ? 'buyer' : depositRole, fee: feeFor(Number(amount), currency, feePayer), creator: req.user.id, parties: [{ user: req.user.id, name: req.user.name, role: creatorRole }] }); if (automation === 'bot') await botMessage(deal, `Welcome to Automated XCROW Bot. Invite the other party with code ${deal.code}. I will guide this escrow for “${deal.title}” and show the fee before payment begins. In this room, type safety, status, wallet, fee, release, refund, or support for help at any time.`); res.status(201).json(publicDeal(deal)); });
-app.post('/api/deals/join', requireDatabase, auth, async (req, res) => { const deal = await Deal.findOne({ code: String(req.body?.code || '').toUpperCase() }); const role = req.body?.role; if (!deal || !['buyer', 'seller'].includes(role)) return res.status(404).json({ error: 'Enter a valid five-letter escrow code and select a role.' }); if (deal.status === 'Closed') return res.status(409).json({ error: 'Escrow session closed. Please open a new one.' }); if (deal.parties.some(p => p.role === role && String(p.user) !== req.user.id)) return res.status(409).json({ error: `The ${role} role has already joined.` }); if (!isMember(deal, req.user.id)) deal.parties.push({ user: req.user.id, name: req.user.name, role }); if (deal.parties.some(p => p.role === 'buyer') && deal.parties.some(p => p.role === 'seller')) { deal.status = deal.automation === 'bot' ? 'Bot confirmation required' : 'Awaiting both confirmations'; await deal.save(); if (deal.automation === 'bot') await botMessage(deal, `🤖 Welcome ${partyName(deal, 'buyer')} and ${partyName(deal, 'seller')} to your Automated XCROW Bot room. I will guide this transaction for “${deal.title}”. Amount: ${Number(deal.amount).toLocaleString()} ${deal.currency}. Fee: ${Number(deal.fee.amount).toLocaleString()} ${deal.currency}. Total due: ${Number(deal.fee.buyerTotal).toLocaleString()} ${deal.currency}. Please review the deal and each press Confirm with Bot to continue. No payment prompt will be sent until both confirm.`); } else await deal.save(); res.json(publicDeal(deal)); });
-app.post('/api/deals/:id/bot-confirm', requireDatabase, auth, async (req, res) => { const deal = await Deal.findById(req.params.id); const role = deal && myRole(deal, req.user.id); if (!deal || deal.automation !== 'bot' || !['buyer', 'seller'].includes(role)) return res.status(403).json({ error: 'Only the buyer or seller in an automated escrow can confirm with the bot.' }); if (deal.status !== 'Bot confirmation required') return res.status(409).json({ error: 'This bot confirmation is no longer available.' }); if (!deal.botConfirmedBy.some(item => String(item.user) === String(req.user.id))) deal.botConfirmedBy.push({ user: req.user.id, role, at: new Date() }); const bothConfirmed = deal.botConfirmedBy.some(item => item.role === 'buyer') && deal.botConfirmedBy.some(item => item.role === 'seller'); await deal.save(); if (bothConfirmed) { await botMessage(deal, '🤖 Both parties confirmed. I am now preparing the secure payment step.'); await beginAutomatedDeposit(deal); } else await botMessage(deal, `🤖 ${partyName(deal, role)} confirmed. Waiting for the other party to confirm before the secure payment step begins.`); res.json(publicDeal(deal)); });
-app.post('/api/deals/:id/ready', requireDatabase, auth, async (req, res) => { const deal = await Deal.findById(req.params.id); const role = deal && myRole(deal, req.user.id); if (!deal || !['buyer', 'seller'].includes(role)) return res.status(404).json({ error: 'Escrow not found.' }); if (deal.status === 'Closed') return res.status(409).json({ error: 'Escrow session closed. Please open a new one.' }); if (deal.status !== 'Awaiting both confirmations' && deal.status !== 'Ready to deposit') return res.status(409).json({ error: 'This escrow is not available for readiness confirmation.' }); if (!deal.readyBy.some(item => String(item.user) === req.user.id)) deal.readyBy.push({ user: req.user.id, role, at: new Date() }); if (deal.readyBy.some(item => item.role === 'buyer') && deal.readyBy.some(item => item.role === 'seller')) deal.status = 'Ready to deposit'; await deal.save(); res.json(publicDeal(deal)); });
-app.post('/api/join/:code/:role', requireDatabase, auth, async (req, res) => { const deal = await Deal.findOne({ code: req.params.code }); if (!deal || req.params.role !== 'third_party') return res.status(404).json({ error: 'This invitation is invalid.' }); if (deal.status === 'Closed') return res.status(409).json({ error: 'Escrow session closed. Please open a new one.' }); if (!isMember(deal, req.user.id)) deal.parties.push({ user: req.user.id, name: req.user.name, role: 'third_party' }); await deal.save(); res.json(publicDeal(deal)); });
-app.post('/api/deals/:id/checkout', requireDatabase, auth, async (req, res) => { try { const deal = await Deal.findById(req.params.id); if (!deal || !isMember(deal, req.user.id)) return res.status(404).json({ error: 'Escrow not found.' }); if (deal.status !== 'Ready to deposit') return res.status(409).json({ error: 'Both buyer and seller must confirm readiness before a deposit can start.' }); if (myRole(deal, req.user.id) !== deal.depositRole) return res.status(403).json({ error: `The ${deal.depositRole} starts this deposit.` }); const total = deal.fee.buyerTotal; if (deal.currency === 'KES') { if (!process.env.HASHPAY_ACCOUNT_ID || !process.env.HASHPAY_API_KEY) return res.status(503).json({ error: 'HashPay KES account settings are missing on this service.' }); const payer = await User.findById(req.user.id); const phone = payer?.profile?.mpesaNumber || ''; if (!phone) return res.status(422).json({ error: 'Save your M-Pesa number in Profile settings before starting a deposit.' }); const reference = `XCROW-${deal.code}-${Date.now()}`; const stk = await sendStk({ amount: total, phone, reference }); deal.payments.push({ method: 'KES_STK', amount: total, status: 'pending', reference, checkoutId: stk.checkout_id }); deal.status = 'Deposit prompt sent'; await deal.save(); return res.json({ provider: 'xcrow-stk', amount: total, reference }); } if (!hashpay) return res.status(503).json({ error: 'HashPay crypto credentials are not configured on this service.' }); const invoice = await hashpay.createInvoice({ amount: String(total), settlementCurrency: 'USD', tokenSymbol: 'USDT', network: 'tron' }); deal.payments.push({ invoiceId: invoice.id, checkoutUrl: invoice.checkoutUrl, method: 'USDT_TRC20', amount: total, status: 'pending' }); deal.status = 'Checkout opened'; await deal.save(); return res.json({ provider: 'hashpay-crypto', checkoutUrl: invoice.checkoutUrl, invoiceId: invoice.id, walletAddress: invoice.walletAddress }); } catch (error) { console.error('Checkout creation failed:', error.message); return res.status(502).json({ error: error.message || 'Could not send the deposit prompt.' }); } });
-app.post('/api/deals/:id/resend-stk', requireDatabase, auth, async (req, res) => { try { const deal = await Deal.findById(req.params.id); if (!deal || !isMember(deal, req.user.id) || myRole(deal, req.user.id) !== deal.depositRole) return res.status(403).json({ error: 'Only the selected depositor can resend the payment prompt.' }); const payment = deal.payments.at(-1); const payer = await User.findById(req.user.id); if (deal.currency !== 'KES' || !payment || payment.status === 'paid') return res.status(409).json({ error: 'There is no pending KES payment prompt to resend.' }); const stk = await sendStk({ amount: payment.amount, phone: payer?.profile?.mpesaNumber, reference: payment.reference }); payment.checkoutId = stk.checkout_id; deal.status = 'Deposit prompt resent'; await deal.save(); res.json({ message: 'Deposit prompt sent again.' }); } catch (error) { res.status(502).json({ error: error.message || 'Could not resend prompt.' }); } });
-app.post('/api/deals/:id/release', requireDatabase, auth, async (req, res) => { const deal = await Deal.findById(req.params.id); if (!deal || myRole(deal, req.user.id) !== 'buyer') return res.status(403).json({ error: 'Only the buyer can request release.' }); if (deal.status !== 'Funded') return res.status(409).json({ error: 'Release is available after a confirmed payment.' }); deal.status = 'Release processing'; deal.releaseRequestedAt = new Date(); await deal.save(); if (deal.automation === 'bot') await botMessage(deal, `Release request received. Settlement is now processing to ${partyName(deal, 'seller')}’s saved wallet destination.`); res.json(publicDeal(deal)); });
-app.post('/api/admin/deals/:id/complete', requireDatabase, auth, admin, async (req, res) => { const deal = await Deal.findById(req.params.id); if (!deal) return res.status(404).json({ error: 'Escrow not found.' }); if (deal.status !== 'Release processing') return res.status(409).json({ error: 'Complete escrow is available after the buyer requests release.' }); deal.completedAt = new Date(); deal.completedBy = req.adminUser.id; await closeEscrow(deal, 'Released: this escrow session is now closed.', 'Released'); if (deal.automation === 'bot') await botMessage(deal, `Congratulations ${partyName(deal, 'buyer')} and ${partyName(deal, 'seller')}! “${deal.title}” has been released and this automated escrow is now complete.`); await AdminAction.create({ admin: req.adminUser.id, deal: deal.id, action: 'Released', note: `Escrow ${deal.code}` }); res.json(publicDeal(deal)); });
-app.post('/api/deals/:id/refund', requireDatabase, auth, async (req, res) => { const deal = await Deal.findById(req.params.id); const role = deal && myRole(deal, req.user.id); if (!deal || !['buyer', 'seller'].includes(role)) return res.status(403).json({ error: 'Only buyer and seller can agree to a refund.' }); if (!['Funded', 'Refund requested'].includes(deal.status)) return res.status(409).json({ error: 'Refund is available after a confirmed payment.' }); if (!deal.refundAgreedBy.some(item => String(item.user) === req.user.id)) deal.refundAgreedBy.push({ user: req.user.id, role, at: new Date() }); const agreed = deal.refundAgreedBy.some(item => item.role === 'buyer') && deal.refundAgreedBy.some(item => item.role === 'seller'); if (agreed) { deal.status = 'Refund processing'; await deal.save(); if (deal.automation === 'bot') await botMessage(deal, 'Both parties agreed to a refund. Refund processing has started and will close after secure confirmation.'); } else { deal.status = 'Refund requested'; await deal.save(); } res.json(publicDeal(deal)); });
-app.post('/api/admin/deals/:id/complete-refund', requireDatabase, auth, admin, async (req, res) => { const deal = await Deal.findById(req.params.id); if (!deal) return res.status(404).json({ error: 'Escrow not found.' }); if (deal.status !== 'Refund processing') return res.status(409).json({ error: 'Complete refund is available after both parties agree.' }); await closeEscrow(deal, 'Refunded: this escrow session is now closed.', 'Refunded'); if (deal.automation === 'bot') await botMessage(deal, `Refund completed. ${partyName(deal, 'buyer')} and ${partyName(deal, 'seller')}, this automated escrow is now closed. Thank you for using XCROW.`); await AdminAction.create({ admin: req.adminUser.id, deal: deal.id, action: 'Refunded', note: `Escrow ${deal.code}` }); res.json(publicDeal(deal)); });
-app.post('/api/deals/:id/appeal', requireDatabase, auth, async (req, res) => {
-  const deal = await Deal.findById(req.params.id);
-  const role = deal && myRole(deal, req.user.id);
-  if (!deal || !['buyer', 'seller'].includes(role)) return res.status(403).json({ error: 'Only the buyer or seller can appeal this escrow.' });
-  if (deal.status !== 'Closed' || !['Released', 'Refunded'].includes(deal.finalStatus)) return res.status(409).json({ error: 'An appeal is available only for a released or refunded escrow.' });
-  const supportUser = await User.findOne({ email: { $in: adminEmails() } });
-  if (!supportUser) return res.status(503).json({ error: 'XCROW Support is not configured yet.' });
-  if (!deal.parties.some(item => String(item.user) === String(supportUser.id))) deal.parties.push({ user: supportUser.id, name: 'XCROW Support', role: 'third_party' });
-  deal.status = 'Appeal review';
-  deal.appealedAt = new Date();
-  await deal.save();
-  await Message.create({ deal: deal.id, sender: supportUser.id, senderName: 'XCROW Support', body: `An appeal was opened by the ${role}. XCROW Support has joined this escrow for review.` });
-  await AdminAction.create({ admin: supportUser.id, deal: deal.id, action: 'Appeal opened', note: `Escrow ${deal.code}` });
-  res.json(publicDeal(deal));
+app.get('/api/workspaces/progress', auth, async (req, res) => {
+  const rows = await Progress.find({ userId: req.user.id }).select('workspace levels updatedAt');
+  res.json({ progress: rows });
 });
-app.post('/api/deals/:id/feedback', requireDatabase, auth, async (req, res) => {
-  const deal = await Deal.findById(req.params.id);
-  const role = deal && myRole(deal, req.user.id);
-  const rating = Number(req.body?.rating);
-  const comment = String(req.body?.comment || '').trim();
-  if (!deal || !['buyer', 'seller'].includes(role)) return res.status(403).json({ error: 'Only the buyer or seller can rate this escrow.' });
-  if (deal.status !== 'Closed' || !['Released', 'Refunded'].includes(deal.finalStatus)) return res.status(409).json({ error: 'Feedback is available after a released or refunded escrow closes.' });
-  if (!Number.isInteger(rating) || rating < 1 || rating > 5) return res.status(400).json({ error: 'Choose a rating from 1 to 5 stars.' });
-  const feedback = await DealFeedback.findOneAndUpdate({ deal: deal.id, user: req.user.id }, { rating, comment }, { new: true, upsert: true, setDefaultsOnInsert: true });
-  res.status(201).json({ id: feedback.id, rating: feedback.rating, comment: feedback.comment, createdAt: feedback.createdAt });
+app.get('/api/workspaces/:slug/levels/:level/questions', auth, async (req, res) => {
+  const level = Number(req.params.level), questions = getQuestions(req.params.slug, level);
+  if (!questions || !Number.isInteger(level) || level < 1 || level > 6) return res.status(404).json({ error: 'Workspace or level not found.' });
+  const wallet = await walletSummary(req.user.id);
+  if (!wallet.assessmentsUnlocked) return res.status(403).json({ error: wallet.totalDeposited < 650 ? 'Deposit at least KES 650 and wait for payment confirmation to unlock assessments.' : 'Your available balance must be at least KES 650 to access assessments. Deposit again to unlock them.' });
+  const order = shuffle([...questions]);
+  const randomized = order.map(q => { const choices = shuffle(q.choices.map((text,index)=>({text,index}))); return { id:q.id, prompt:q.prompt, choices:choices.map(c=>c.text), correctChoice:choices.findIndex(c=>c.index===q.correct) }; });
+  const attempt = await QuestionAttempt.create({ userId:req.user.id, workspace:req.params.slug, level, answers:randomized.map(q=>({questionId:q.id,correctChoice:q.correctChoice})), expiresAt:new Date(Date.now()+60*60*1000) });
+  const settings = await getQuizSettings();
+  res.json({ title: WORKSPACES.find(w=>w.slug===req.params.slug).title, level, attemptId:attempt.id, skillPointsPerCorrect: settings.skillPointsPerCorrect, difficultyMultiplier: settings.difficultyMultipliers[level-1] || 1, questions:randomized.map(({id,prompt,choices})=>({id,prompt,choices})) });
 });
-app.post('/api/deals/:id/support', requireDatabase, auth, async (req, res) => { const deal = await Deal.findById(req.params.id); if (!deal || !isMember(deal, req.user.id)) return res.status(404).json({ error: 'Escrow not found.' }); if (deal.status === 'Closed') return res.status(409).json({ error: 'Escrow session closed. Use Appeal to request a review.' }); if (!deal.parties.some(item => item.name === 'XCROW Support')) { const supportUser = await User.findOne({ email: { $in: adminEmails() } }); if (!supportUser) return res.status(503).json({ error: 'XCROW Support is not configured yet.' }); deal.parties.push({ user: supportUser.id, name: 'XCROW Support', role: 'third_party' }); deal.status = deal.status === 'Funded' ? 'Support review requested' : deal.status; await deal.save(); await Message.create({ deal: deal.id, sender: supportUser.id, senderName: 'XCROW Support', body: 'XCROW Support has joined this escrow and can now oversee the conversation.' }); } else await deal.save(); res.json(publicDeal(deal)); });
-app.post('/api/deals/:id/usdt-pending', requireDatabase, auth, async (req, res) => { const deal = await Deal.findById(req.params.id); if (!deal || myRole(deal, req.user.id) !== deal.depositRole || deal.currency !== 'USDT') return res.status(403).json({ error: 'This USDT confirmation request is not available.' }); if (!['Ready to deposit', 'Awaiting TRC20 confirmation'].includes(deal.status)) return res.status(409).json({ error: 'This escrow is not ready for a USDT confirmation request.' }); const existing = deal.payments.find(item => item.method === 'USDT_TRC20' && item.status === 'pending'); if (!existing) deal.payments.push({ method: 'USDT_TRC20', amount: deal.fee.buyerTotal, status: 'pending', reference: `XCROW-${deal.code}-TRC20` }); deal.status = 'Awaiting TRC20 confirmation'; await deal.save(); res.json(publicDeal(deal)); });
-function adminDeal(deal, emails) { const value = publicDeal(deal); return { ...value, parties: value.parties.map(party => ({ ...party, email: emails.get(String(party.user)) || (party.name === 'XCROW Support' ? 'support@xcrow.com' : 'Not available') })) }; }
-app.get('/api/admin/summary', requireDatabase, auth, admin, async (_req, res) => { const [users, escrows, active, trc20Pending, allDeals, members, actions] = await Promise.all([User.countDocuments(), Deal.countDocuments(), Deal.countDocuments({ status: { $in: ['Funded','Ready to deposit','Awaiting TRC20 confirmation','Deposit prompt sent','Refund processing','Support review requested','Dispute review'] } }), Deal.find({ 'payments.method': 'USDT_TRC20', 'payments.status': 'pending' }).sort({ updatedAt: -1 }), Deal.find().sort({ updatedAt: -1 }).limit(250), User.find().select('name email createdAt').sort({ createdAt: -1 }).limit(500), AdminAction.find().sort({ createdAt: -1 }).limit(100)]); const emailMap = new Map(members.map(member => [String(member.id), member.email])); res.json({ users, escrows, active, members: members.map(member => ({ id: member.id, name: member.name, email: member.email, joinedAt: member.createdAt })), allEscrows: allDeals.map(deal => adminDeal(deal, emailMap)), trc20Pending: trc20Pending.map(deal => adminDeal(deal, emailMap)), actions }); });
-app.post('/api/admin/deals/:id/dispute', requireDatabase, auth, admin, async (req, res) => { const deal = await Deal.findById(req.params.id); const note = String(req.body?.note || '').trim(); if (!deal) return res.status(404).json({ error: 'Escrow not found.' }); deal.status = 'Dispute review'; await deal.save(); await Message.create({ deal: deal.id, sender: req.adminUser.id, senderName: 'XCROW Support', body: note || 'XCROW Support has opened a dispute review for this escrow.' }); await AdminAction.create({ admin: req.adminUser.id, deal: deal.id, action: 'Opened dispute review', note }); res.json(publicDeal(deal)); });
-app.post('/api/admin/deals/:id/support', requireDatabase, auth, admin, async (req, res) => { const deal = await Deal.findById(req.params.id); if (!deal) return res.status(404).json({ error: 'Escrow not found.' }); if (!deal.parties.some(item => item.name === 'XCROW Support')) { deal.parties.push({ user: req.adminUser.id, name: 'XCROW Support', role: 'third_party' }); await deal.save(); await Message.create({ deal: deal.id, sender: req.adminUser.id, senderName: 'XCROW Support', body: 'XCROW Support has joined this escrow and is overseeing the conversation.' }); await AdminAction.create({ admin: req.adminUser.id, deal: deal.id, action: 'Joined as support', note: 'Support added to escrow chat' }); } res.json(publicDeal(deal)); });
-app.post('/api/deals/code/:code/usdt-pending', requireDatabase, auth, async (req, res) => { const deal = await Deal.findOne({ code: String(req.params.code || '').toUpperCase() }); if (!deal || myRole(deal, req.user.id) !== deal.depositRole || deal.currency !== 'USDT') return res.status(403).json({ error: 'This USDT confirmation request is not available.' }); if (!['Ready to deposit', 'Awaiting TRC20 confirmation'].includes(deal.status)) return res.status(409).json({ error: 'This escrow is not ready for a USDT confirmation request.' }); const existing = deal.payments.find(item => item.method === 'USDT_TRC20' && item.status === 'pending'); if (!existing) deal.payments.push({ method: 'USDT_TRC20', amount: deal.fee.buyerTotal, status: 'pending', reference: `XCROW-${deal.code}-TRC20` }); deal.status = 'Awaiting TRC20 confirmation'; await deal.save(); res.json(publicDeal(deal)); });
-app.get('/api/admin/portal', requireDatabase, auth, admin, async (_req, res) => { const [members, deals, actions] = await Promise.all([User.find().select('name email createdAt').sort({ createdAt: -1 }).limit(500), Deal.find().sort({ updatedAt: -1 }).limit(250), AdminAction.find().sort({ createdAt: -1 }).limit(100)]); const emailMap = new Map(members.map(member => [String(member.id), member.email])); const escrowList = deals.map(deal => adminDeal(deal, emailMap)); const trc20Pending = escrowList.filter(deal => deal.payments.some(payment => payment.method === 'USDT_TRC20' && payment.status === 'pending')); const active = escrowList.filter(deal => ['Funded','Ready to deposit','Awaiting TRC20 confirmation','Deposit prompt sent','Refund processing','Support review requested','Dispute review'].includes(deal.status)).length; res.json({ counts: { members: members.length, escrows: escrowList.length, active, trc20Pending: trc20Pending.length }, members: members.map(member => ({ id: member.id, name: member.name, email: member.email, joinedAt: member.createdAt })), escrows: escrowList, trc20Pending, actions }); });
-app.post('/api/admin/deals/:id/mark-crypto-funded', requireDatabase, auth, admin, async (req, res) => { const deal = await Deal.findById(req.params.id); if (!deal || deal.currency !== 'USDT') return res.status(404).json({ error: 'USDT escrow not found.' }); let payment = deal.payments.find(item => item.method === 'USDT_TRC20' && item.status === 'pending'); if (!payment) { deal.payments.push({ method: 'USDT_TRC20', amount: deal.fee.buyerTotal, status: 'pending', reference: `XCROW-${deal.code}-TRC20` }); payment = deal.payments.at(-1); } payment.status = 'paid'; payment.paidAt = new Date(); payment.reference = String(req.body?.transactionHash || '').trim() || payment.reference; deal.status = 'Funded'; await deal.save(); await AdminAction.create({ admin: req.adminUser.id, deal: deal.id, action: 'Funded', note: `Escrow ${deal.code}` }); res.json(publicDeal(deal)); });
-app.post('/api/admin/deals/:id/mark-mpesa-received', requireDatabase, auth, admin, async (req, res) => { const deal = await Deal.findById(req.params.id); if (!deal || deal.currency !== 'KES') return res.status(404).json({ error: 'Kenyan-shilling escrow not found.' }); let payment = deal.payments.find(item => item.method === 'KES_STK' && item.status === 'pending'); if (!payment) { deal.payments.push({ method: 'KES_STK', amount: deal.fee.buyerTotal, status: 'pending', reference: `XCROW-${deal.code}-KES` }); payment = deal.payments.at(-1); } payment.status = 'paid'; payment.paidAt = new Date(); payment.reference = String(req.body?.reference || '').trim() || payment.reference; deal.status = 'Funded'; await deal.save(); if (deal.automation === 'bot') await botMessage(deal, `🤖 Deposit verified and securely locked. ${partyName(deal, 'seller')}, you may now proceed with “${deal.title}”. ${partyName(deal, 'buyer')}, use Release only after you have received and checked the agreed item or service.`); await AdminAction.create({ admin: req.adminUser.id, deal: deal.id, action: 'Funded', note: `Escrow ${deal.code}` }); res.json(publicDeal(deal)); });
-app.post('/api/admin/deals/:id/confirm-trc20', requireDatabase, auth, admin, async (req, res) => { const deal = await Deal.findById(req.params.id); const payment = deal?.payments.find(item => item.method === 'USDT_TRC20' && item.status === 'pending'); if (!deal || !payment) return res.status(404).json({ error: 'No pending TRC20 payment was found.' }); payment.status = 'paid'; payment.paidAt = new Date(); payment.reference = String(req.body?.transactionHash || '').trim() || payment.reference; deal.status = 'Funded'; await deal.save(); if (deal.automation === 'bot') await botMessage(deal, `🤖 Deposit verified and securely locked. ${partyName(deal, 'seller')}, you may now proceed with “${deal.title}”. ${partyName(deal, 'buyer')}, use Release only after you have received and checked the agreed item or service.`); await AdminAction.create({ admin: req.adminUser.id, deal: deal.id, action: 'Funded', note: `Escrow ${deal.code}` }); res.json(publicDeal(deal)); });
-app.post('/api/admin/deals/:id/messages', requireDatabase, auth, admin, async (req, res) => { const deal = await Deal.findById(req.params.id); const body = String(req.body?.body || '').trim(); if (!deal || !body) return res.status(400).json({ error: 'A deal and message are required.' }); const message = await Message.create({ deal: deal.id, sender: req.adminUser.id, senderName: 'XCROW Support', body }); await AdminAction.create({ admin: req.adminUser.id, deal: deal.id, action: 'Support message', note: body.slice(0, 120) }); res.status(201).json(message); });
-app.get('/api/deals/:id/messages', requireDatabase, auth, async (req, res) => { const deal = await Deal.findById(req.params.id); const supportPresent = deal?.parties.some(item => item.name === 'XCROW Support'); if (!deal || (!isMember(deal, req.user.id) && !(req.user.admin && supportPresent))) return res.status(404).json({ error: 'Escrow not found.' }); res.json(await Message.find({ deal: deal.id }).sort({ createdAt: 1 }).limit(200)); });
-app.get('/api/deals/code/:code/messages', requireDatabase, auth, async (req, res) => { const deal = await Deal.findOne({ code: String(req.params.code || '').toUpperCase() }); const supportPresent = deal?.parties.some(item => item.name === 'XCROW Support'); if (!deal || (!isMember(deal, req.user.id) && !(req.user.admin && supportPresent))) return res.status(404).json({ error: 'Escrow not found.' }); res.json(await Message.find({ deal: deal.id }).sort({ createdAt: 1 }).limit(200)); });
-app.post('/api/deals/:id/messages', requireDatabase, auth, async (req, res) => { const deal = await Deal.findById(req.params.id); const body = String(req.body?.body || '').trim(); const supportPresent = deal?.parties.some(item => item.name === 'XCROW Support'); if (!deal || (!isMember(deal, req.user.id) && !(req.user.admin && supportPresent))) return res.status(404).json({ error: 'Escrow not found.' }); if (deal.status === 'Closed') return res.status(409).json({ error: 'Escrow session closed. Use Appeal to request a review.' }); if (!body) return res.status(400).json({ error: 'Write a message first.' }); const sent = await Message.create({ deal: deal.id, sender: req.user.id, senderName: req.user.admin && supportPresent ? 'XCROW Support' : req.user.name, body }); if (deal.automation === 'bot' && !req.user.admin) { const text = body.toLowerCase(); const buyer = partyName(deal, 'buyer'); const seller = partyName(deal, 'seller'); const amount = Number(deal.amount).toLocaleString(); const fee = Number(deal.fee.amount).toLocaleString(); const total = Number(deal.fee.buyerTotal).toLocaleString(); const release = Number(deal.fee.sellerReceives).toLocaleString(); if (/support|help|human|agent/.test(text)) await botMessage(deal, '🎧 Live human support is available.\nTap Connect human support to invite a support specialist into this room.\nKeep every agreement and payment discussion here.'); else if (/safe|safety|scam|verify|fraud|secure/.test(text)) await botMessage(deal, '🛡️ Verify the escrow code and total on this screen.\nKeep communication inside this room.\nNever share passwords, PINs, one-time codes, or wallet recovery phrases.'); else if (/wallet|mpesa|trc20|address|binance/.test(text)) await botMessage(deal, '💳 Save receiving details in Wallet & profile.\nThe buyer’s saved M-Pesa number receives the KES prompt.\nUse only the displayed QR code and address for TRC20.'); else if (/status|progress|summary|details|overview/.test(text)) await botMessage(deal, `📊 Buyer: ${buyer}.\n📦 Seller: ${seller}.\n⏳ Current stage: ${deal.status}.\n💰 Locked amount: ${total} ${deal.currency}.\n🔐 Expected seller release: ${release} ${deal.currency}.`); else if (/deliver|delivery|received|inspection|item|service/.test(text)) await botMessage(deal, `📦 Seller: deliver “${deal.title}” as agreed.\n🧾 Keep delivery evidence in this room.\n🔍 Buyer: inspect before choosing Release.\n↩️ Use Refund only if both parties agree.`); else if (/refund|cancel|return/.test(text)) await botMessage(deal, '↩️ Refund needs agreement from buyer and seller.\n⏳ The room changes to Refund processing after both agree.\n🧾 Keep the reason and evidence in this chat.'); else if (/release|complete|settle|payout/.test(text)) await botMessage(deal, `🔐 Only ${buyer} can request release.\n✔️ Release only after “${deal.title}” is received as agreed.\n💰 Expected seller release: ${release} ${deal.currency}.`); else if (/fee|total|amount|cost|price/.test(text)) await botMessage(deal, `💰 Agreed amount: ${amount} ${deal.currency}.\n📋 XCROW fee: ${fee} ${deal.currency}.\n🔒 Deposit total: ${total} ${deal.currency}.\n✔️ Seller release: ${release} ${deal.currency}.`); else if (/code|invite|join|party/.test(text)) await botMessage(deal, `🔑 Escrow code: ${deal.code}.\n👥 Share it only with the intended buyer or seller.\n➕ Both roles must join before confirmation begins.`); else if (/time|hour|deadline|expire/.test(text)) await botMessage(deal, '⏱️ An inactive session closes after one hour.\n🔒 Finished escrows are closed for protection.\n⚖️ Use Appeal if a finished escrow needs review.'); else if (/evidence|proof|receipt|photo/.test(text)) await botMessage(deal, '🧾 Keep receipts, delivery proof, and agreed details in this room.\n📸 Do not share card details, passwords, or recovery phrases.\n⚖️ Clear evidence helps with a dispute or appeal.'); else if (/privacy|personal|data/.test(text)) await botMessage(deal, '🔐 Keep private information limited to what the escrow needs.\n🚫 Never post passwords, PINs, OTPs, or recovery phrases.\n🛡️ Use Wallet & profile for receiving details.'); else if (/hello|hi|start|guide|how/.test(text)) await botMessage(deal, '🤖 I am Automated XCROW Bot.\n🔒 I guide this protected escrow step by step.\n✨ Open Useful prompts for clear help at any time.'); }
-  res.status(201).json(sent); });
-app.get('/api/support/ticket', requireDatabase, auth, async (req, res) => { const ticket = await SupportTicket.findOne({ user: req.user.id }).sort({ updatedAt: -1 }); res.json(ticket || null); });
-app.post('/api/support/ticket', requireDatabase, auth, async (req, res) => { const body = String(req.body?.body || '').trim(); if (!body) return res.status(400).json({ error: 'Write a support message first.' }); let ticket = await SupportTicket.findOne({ user: req.user.id, status: 'open' }).sort({ updatedAt: -1 }); if (!ticket) ticket = await SupportTicket.create({ user: req.user.id, userName: req.user.name, email: (await User.findById(req.user.id)).email, messages: [] }); ticket.messages.push({ sender: req.user.name, body, at: new Date() }); await ticket.save(); res.status(201).json(ticket); });
-app.get('/api/admin/support-tickets', requireDatabase, auth, admin, async (_req, res) => res.json(await SupportTicket.find().sort({ updatedAt: -1 }).limit(200)));
-app.post('/api/admin/support-tickets/:id/reply', requireDatabase, auth, admin, async (req, res) => { const ticket = await SupportTicket.findById(req.params.id); const body = String(req.body?.body || '').trim(); if (!ticket || !body) return res.status(400).json({ error: 'Ticket and reply are required.' }); ticket.messages.push({ sender: 'XCROW Support', body, at: new Date() }); await ticket.save(); res.json(ticket); });
-app.get('/api/deals/:id/receipt/:paymentId', requireDatabase, auth, async (req, res) => { const deal = await Deal.findById(req.params.id); const payment = deal?.payments.id(req.params.paymentId); if (!deal || !payment || !isMember(deal, req.user.id)) return res.status(404).json({ error: 'Receipt not found.' }); if (payment.status !== 'paid') return res.status(409).json({ error: 'A receipt is available after payment confirmation.' }); const buyerParty = deal.parties.find(p => p.role === 'buyer'); const sellerParty = deal.parties.find(p => p.role === 'seller'); const sellerAccount = sellerParty?.user ? await User.findById(sellerParty.user) : null; const buyer = buyerParty?.name || 'Pending'; const seller = sellerParty?.name || 'Pending'; const recipient = deal.currency === 'KES' ? sellerAccount?.profile?.mpesaNumber : (sellerAccount?.profile?.trc20Address || sellerAccount?.profile?.binanceId); const settled = deal.status === 'Released'; const formatTime = value => value ? new Date(value).toLocaleString('en-KE', { dateStyle: 'medium', timeStyle: 'short' }) : 'Pending'; const rows = [['Escrow code', deal.code], ['Transaction reference', payment.reference || `XCROW-${deal.code}`], ['Payment method', payment.method === 'KES_STK' ? 'Kenyan Shilling - M-Pesa' : 'USDT - TRC20'], ['Payment for', deal.title], ['Funded', formatTime(payment.paidAt)], ['Buyer', buyer], ['Seller', seller], ['Status', settled ? 'Released' : deal.status], ['Released', settled ? formatTime(deal.completedAt) : 'Pending'], ['Recipient', recipient || 'Seller destination not provided']]; res.setHeader('Content-Type', 'application/pdf'); res.setHeader('Content-Disposition', `attachment; filename="XCROW-${deal.code}-receipt.pdf"`); const pdf = new PDFDocument({ size: 'A4', margin: 46, info: { Title: `XCROW receipt ${deal.code}`, Author: 'XCROW.COM' } }); pdf.pipe(res); const left = 46; const width = 503; pdf.rect(0, 0, 595, 115).fill('#11213d'); pdf.fillColor('#ffffff').font('Helvetica-Bold').fontSize(26).text('XCROW', left, 38); pdf.fillColor('#93c5fd').fontSize(10).text('ESCROW SERVICES  |  OFFICIAL TRANSACTION RECEIPT', left, 71); pdf.fillColor('#ffffff').fontSize(18).text(settled ? 'RELEASE RECEIPT' : 'PAYMENT RECEIPT', 350, 41, { width: 199, align: 'right' }); pdf.fillColor('#bfdbfe').font('Helvetica').fontSize(9).text(`Issued ${formatTime(new Date())}`, 350, 71, { width: 199, align: 'right' }); pdf.roundedRect(left, 137, width, 104, 10).fill('#eff6ff'); pdf.fillColor('#47627f').font('Helvetica-Bold').fontSize(10).text(settled ? 'AMOUNT RELEASED TO SELLER' : 'AMOUNT FUNDED', left + 22, 159); pdf.fillColor('#172033').fontSize(29).text(`${Number(settled ? (deal.fee?.sellerReceives ?? payment.amount) : payment.amount).toLocaleString()} ${deal.currency}`, left + 22, 180); pdf.fillColor(settled ? '#15803d' : '#2563eb').roundedRect(408, 168, 113, 28, 14).fill(); pdf.fillColor('#ffffff').fontSize(10).text(settled ? 'RELEASED' : 'FUNDED', 408, 177, { width: 113, align: 'center' }); pdf.fillColor('#172033').font('Helvetica-Bold').fontSize(15).text('Transaction details', left, 275); let y = 303; rows.forEach(([label, value], index) => { if (index % 2 === 0) pdf.rect(left, y - 6, width, 27).fill('#f8fafc'); pdf.fillColor('#64748b').font('Helvetica-Bold').fontSize(9).text(label.toUpperCase(), left + 12, y + 2); pdf.fillColor('#172033').font('Helvetica').fontSize(10).text(String(value), 225, y + 1, { width: 310, align: 'right', ellipsis: true }); y += 29; }); pdf.moveTo(left, 575).lineTo(left + width, 575).strokeColor('#dce3ed').stroke(); pdf.fillColor('#172033').font('Helvetica-Bold').fontSize(11).text('Receipt summary', left, 594); pdf.fillColor('#64748b').font('Helvetica').fontSize(9).text(settled ? `Payment released to ${seller}. Keep this receipt as your record of settlement.` : 'This receipt confirms that the escrow is funded.', left, 613, { width, lineGap: 3 }); pdf.fillColor('#94a3b8').fontSize(8).text(`XCROW.COM  |  Receipt ID: XC-${deal.code}-${String(payment._id).slice(-6).toUpperCase()}  |  Generated securely`, left, 740, { width, align: 'center' }); pdf.end(); });
-// Render probes this endpoint continuously. It must remain HTTP 200 during a
-// short MongoDB reconnect; otherwise Render can remove or restart a healthy
-// web process and browsers see ERR_CONNECTION_CLOSED.
-app.get('/health', (_req, res) => { const database = mongoose.connection.readyState === 1; res.json({ status: database ? 'ok' : 'degraded', database, hashpayConfigured: Boolean(hashpay), release, uptimeSeconds: Math.round(process.uptime()) }); });
-app.get('/api/payment-info', (_req, res) => res.json({ usdtAddress }));
-app.get('/join/:code/:role', (_req, res) => res.sendFile(new URL('./public/index.html', import.meta.url).pathname));
-app.use((error, _req, res, _next) => { console.error('Unhandled XCROW request error:', error.message); if (res.headersSent) return; res.status(500).json({ error: 'XCROW could not complete that request. Please retry.' }); });
-const server = app.listen(port, () => console.log(`XCROW running on :${port}`));
-// Webhooks are the primary confirmation path. This periodic provider check is
-// deliberately limited and only covers pending STK prompts, so a delayed or
-// retried provider webhook cannot leave genuine M-Pesa funds stuck pending.
-setInterval(() => reconcilePendingStkPayments().catch(error => console.warn('STK reconciliation cycle failed:', error.message)), 30000).unref();
-setInterval(() => closeInactiveEscrows().catch(error => console.warn('Escrow closure cycle failed:', error.message)), 60000).unref();
-setTimeout(() => closeInactiveEscrows().catch(error => console.warn('Initial escrow closure check failed:', error.message)), 5000).unref();
-// Keep these aligned for Render's reverse proxy so normal mobile requests are
-// not cut off while a database connection is being established.
-server.keepAliveTimeout = 65000;
-server.headersTimeout = 66000;
+app.post('/api/workspaces/:slug/levels/:level/complete', auth, async (req, res) => {
+  const level = Number(req.params.level), answers = req.body?.answers, attemptId=req.body?.attemptId;
+  if (!getQuestions(req.params.slug,level) || !Number.isInteger(level) || level < 1 || level > 6) return res.status(404).json({ error: 'Workspace or level not found.' });
+  if (!Array.isArray(answers) || answers.length !== 10 || answers.some(n => !Number.isInteger(n) || n < 0 || n > 3) || !mongoose.isValidObjectId(attemptId)) return res.status(400).json({ error: 'Answer all 10 questions before submitting.' });
+  const session = await mongoose.startSession(); let result;
+  try {
+    await session.withTransaction(async () => {
+      let progress = await Progress.findOne({ userId: req.user.id, workspace: req.params.slug }).session(session);
+      const paid = await Deposit.aggregate([{ $match: { userId: new mongoose.Types.ObjectId(req.user.id), status: 'paid' } }, { $group: { _id: null, total: { $sum: '$amount' } } }]).session(session);
+      const account = await User.findById(req.user.id).select('walletBalance reservedBalance').session(session);
+      const available = account ? account.walletBalance - account.reservedBalance : 0;
+      if ((paid[0]?.total || 0) < 650 || available < 650) throw Object.assign(new Error((paid[0]?.total || 0) < 650 ? 'Deposit at least KES 650 and wait for payment confirmation to unlock assessments.' : 'Your available balance must be at least KES 650 to access assessments. Deposit again to unlock them.'), { status: 403 });
+      const attempt = await QuestionAttempt.findOneAndUpdate({ _id:attemptId,userId:req.user.id,workspace:req.params.slug,level,usedAt:null,expiresAt:{$gt:new Date()} },{ $set:{usedAt:new Date()} },{new:true,session});
+      if (!attempt || attempt.answers.length !== 10) throw Object.assign(new Error('This quiz attempt expired or was already submitted. Start the level again.'), { status: 409 });
+      const score = attempt.answers.reduce((total, question, i) => total + (question.correctChoice === answers[i] ? 1 : 0), 0);
+      const settings = await getQuizSettings(session), points = Math.round(score * settings.skillPointsPerCorrect * (settings.difficultyMultipliers[level-1] || 1));
+      await User.updateOne({ _id: req.user.id }, { $inc: { skillPoints: points } }, { session });
+      if (!progress) progress = new Progress({ userId: req.user.id, workspace: req.params.slug, levels: [] });
+      const existing = progress.levels.find(row => row.level === level);
+      if (score >= 7) {
+        if (existing) { existing.completed = true; existing.score = Math.max(existing.score || 0, score); existing.points = (existing.points || 0) + points; existing.completedAt = existing.completedAt || new Date(); }
+        else progress.levels.push({ level, completed: true, score, points, completedAt: new Date() });
+      } else if (!existing) progress.levels.push({ level, completed: false, score, points, completedAt: null });
+      else existing.points = (existing.points || 0) + points;
+      progress.updatedAt = new Date(); await progress.save({ session });
+      result = { score, total: 10, passed: score >= 7, points, skillPoints: (await User.findById(req.user.id).select('skillPoints').session(session)).skillPoints, completedLevels: progress.levels.filter(row=>row.completed).length, nextLevel: score >= 7 && level < 6 ? level + 1 : null };
+    });
+  } catch (e) { if (e.status) return res.status(e.status).json({ error: e.message }); throw e; }
+  finally { await session.endSession(); }
+  res.json(result);
+});
+
+async function walletSummary(userId) {
+  const user = await User.findById(userId).select('walletBalance reservedBalance skillPoints');
+  if (!user) throw new Error('Account not found.');
+  const [paidDeposits, earnings] = await Promise.all([
+    Deposit.aggregate([{ $match: { userId: user._id, status: 'paid' } }, { $group: { _id: null, total: { $sum: '$amount' } } }]),
+    Entry.aggregate([{ $match: { userId: user._id, type: 'earning' } }, { $group: { _id: null, total: { $sum: '$amount' } } }])
+  ]);
+  const deposited = paidDeposits[0]?.total || 0, available = user.walletBalance - user.reservedBalance;
+  const depositToUnlock = deposited < 650 ? 650 - deposited : Math.max(0, 650 - available);
+  return { balance: user.walletBalance, available, pendingWithdrawals: user.reservedBalance, totalDeposited: deposited, verifiedEarnings: earnings[0]?.total || 0, skillPoints: user.skillPoints || 0, depositToUnlock, accessProgress: Math.min(100, Math.floor(available / 650 * 100)), withdrawalGap: Math.max(0, 1250 - available), assessmentsUnlocked: deposited >= 650 && available >= 650 };
+}
+app.get('/api/wallet', auth, async (req, res) => res.json(await walletSummary(req.user.id)));
+app.get('/api/wallet/transactions', auth, async (req, res) => {
+  const userId = req.user.id;
+  const [entries, deposits, withdrawals] = await Promise.all([
+    Entry.find({ userId }).sort({ createdAt: -1 }).limit(50).select('type amount direction reference transactionCode note createdAt').lean(),
+    Deposit.find({ userId, status: { $in: ['pending', 'failed'] } }).sort({ createdAt: -1 }).limit(20).select('amount reference transactionCode status createdAt').lean(),
+    Withdrawal.find({ userId, status: { $in: ['pending', 'processing', 'failed'] } }).sort({ createdAt: -1 }).limit(20).select('amount transactionCode status createdAt').lean()
+  ]);
+  const pending = [
+    ...deposits.map(d => ({ type: 'deposit', amount: d.amount, direction: 'credit', reference: `pending-dep:${d.reference}`, transactionCode: d.transactionCode, note: d.status === 'pending' ? 'M-Pesa prompt sent · awaiting payment confirmation' : 'Deposit not completed · no funds added', status: d.status === 'pending' ? 'Prompt sent' : 'Not completed', createdAt: d.createdAt })),
+    ...withdrawals.map(w => ({ type: 'withdrawal', amount: w.amount, direction: 'debit', reference: `pending-wd:${w.id}`, transactionCode: w.transactionCode, note: w.status === 'pending' ? 'Withdrawal request · awaiting admin review' : w.status === 'processing' ? 'Withdrawal processing' : 'Withdrawal failed · funds released', status: w.status === 'pending' ? 'Awaiting review' : w.status === 'processing' ? 'Processing' : 'Failed · funds released', createdAt: w.createdAt }))
+  ];
+  res.json([...entries.map(e => ({ ...e, status: 'Completed' })), ...pending].sort((a,b) => new Date(b.createdAt)-new Date(a.createdAt)).slice(0,50));
+});
+app.post('/api/admin/login', authLimit, async (req,res) => {
+  const email = String(req.body?.email || '').trim().toLowerCase(), password = String(req.body?.password || '');
+  if (password.length < 6 || password.length > 128) return res.status(400).json({ error: 'Administrator password must be 6–128 characters.' });
+  const expected = Buffer.from(process.env.ADMIN_PASSWORD || ''), provided = Buffer.from(password);
+  if (!process.env.ADMIN_PASSWORD) return res.status(503).json({ error: 'Administrator password is not configured in Render.' });
+  const passwordMatches = expected.length === provided.length && crypto.timingSafeEqual(expected, provided);
+  if (email !== configuredAdminEmail() || !passwordMatches) return res.status(401).json({ error: 'Administrator email or password is incorrect.' });
+  const adminEmail = configuredAdminEmail();
+  res.json({ token: jwt.sign({ id: 'admin', email: adminEmail, role: 'admin' }, process.env.JWT_SECRET, { expiresIn: '2h' }) });
+});
+app.get(adminPortalPath(), (_req,res) => { res.set('X-Robots-Tag', 'noindex, nofollow'); res.sendFile(require('path').join(__dirname, 'public', 'index.html')); });
+app.post('/api/admin/earnings', async (req,res) => {
+  if(!adminAuthorized(req))return res.sendStatus(401);
+  const email=String(req.body?.email||'').trim().toLowerCase(),amount=Number(req.body?.amount),workReference=String(req.body?.workReference||'').trim();
+  if(!emailOk(email)||!Number.isSafeInteger(amount)||amount<1||amount>100000||workReference.length<3||workReference.length>100)return res.status(400).json({error:'Provide a valid user email, amount, and unique work reference.'});
+  const user=await User.findOne({email});if(!user)return res.status(404).json({error:'No account matches that email.'});
+  const session=await mongoose.startSession();
+  const transactionCode=await reserveTransactionCode();
+  try{await session.withTransaction(async()=>{await Entry.create([{userId:user._id,type:'earning',amount,transactionCode,reference:`earning:${workReference}`,note:String(req.body?.note||'Verified paid work').slice(0,160)}],{session});await User.updateOne({_id:user._id},{$inc:{walletBalance:amount}},{session})});res.status(201).json({credited:true,amount,reference:workReference,transactionCode})}
+  catch(e){if(e.code===11000)return res.status(409).json({error:'That work reference has already been credited.'});throw e}
+  finally{await session.endSession()}
+});
+app.get('/api/admin/overview', async (req,res) => {
+  if (!adminAuthorized(req)) return res.sendStatus(401);
+  const page = Math.max(1, Math.min(100000, Number.parseInt(req.query.page, 10) || 1)), pageSize = 50;
+  const [members, memberCount, pendingDeposits, pendingWithdrawals] = await Promise.all([
+    User.find().sort({ createdAt: -1 }).skip((page - 1) * pageSize).limit(pageSize).select('name username email phone walletBalance reservedBalance skillPoints createdAt').lean(),
+    User.countDocuments(),
+    Deposit.find({ status: 'pending' }).sort({ createdAt: 1 }).limit(100).populate('userId', 'name email phone').lean(),
+    Withdrawal.find({ status: { $in: ['pending', 'processing'] } }).sort({ createdAt: 1 }).limit(100).populate('userId', 'name email phone').lean()
+  ]);
+  res.json({ members, memberCount, page, pageSize, pendingDeposits, pendingWithdrawals });
+});
+app.get('/api/admin/settings', async (req,res) => {
+  if (!adminAuthorized(req)) return res.sendStatus(401);
+  res.json(await getQuizSettings());
+});
+app.patch('/api/admin/settings', async (req,res) => {
+  if (!adminAuthorized(req)) return res.sendStatus(401);
+  const skillPointsPerCorrect = Number(req.body?.skillPointsPerCorrect), difficultyMultipliers = req.body?.difficultyMultipliers;
+  if (!Number.isInteger(skillPointsPerCorrect) || skillPointsPerCorrect < 20 || skillPointsPerCorrect > 1000 || !Array.isArray(difficultyMultipliers) || difficultyMultipliers.length !== 6 || difficultyMultipliers.some(n => typeof n !== 'number' || !Number.isFinite(n) || n < 1 || n > 10)) return res.status(400).json({ error: 'Set at least 20 non-cash skill points per correct answer and six difficulty multipliers (1–10).' });
+  const settings = await QuizSettings.findOneAndUpdate({ key: 'main' }, { $set: { skillPointsPerCorrect, difficultyMultipliers, updatedAt: new Date() } }, { new: true, upsert: true, runValidators: true });
+  res.json({ skillPointsPerCorrect: settings.skillPointsPerCorrect, difficultyMultipliers: settings.difficultyMultipliers });
+});
+app.post('/api/admin/members/:id/wallet-transactions', async (req,res) => {
+  if (!adminAuthorized(req)) return res.sendStatus(401);
+  if (!mongoose.isValidObjectId(req.params.id)) return res.status(404).json({ error: 'Member not found.' });
+  const amount = Number(req.body?.amount), action = req.body?.action, reason = String(req.body?.reason || '').trim();
+  if (!Number.isSafeInteger(amount) || amount < 1 || amount > (action === 'withdraw' ? 12000 : 100000) || !['deposit', 'withdraw'].includes(action) || reason.length < 8 || reason.length > 180) return res.status(400).json({ error: 'Choose deposit or withdraw, enter a valid KES amount, and provide a reason (8–180 characters).' });
+  const direction = action === 'deposit' ? 'credit' : 'debit';
+  const transactionCode = await reserveTransactionCode();
+  const session = await mongoose.startSession();
+  try {
+    await session.withTransaction(async () => {
+      const filter = direction === 'debit' ? { _id: req.params.id, $expr: { $gte: [{ $subtract: ['$walletBalance', '$reservedBalance'] }, amount] } } : { _id: req.params.id };
+      const delta = direction === 'credit' ? amount : -amount;
+      const user = await User.findOneAndUpdate(filter, { $inc: { walletBalance: delta } }, { new: true, session });
+      if (!user) throw Object.assign(new Error(direction === 'debit' ? 'Member not found or debit exceeds the available balance.' : 'Member not found.'), { status: direction === 'debit' ? 409 : 404 });
+      await Entry.create([{ userId: user._id, type: action === 'deposit' ? 'deposit' : 'withdrawal', amount, direction, transactionCode, reference: `admin-${action}:${crypto.randomUUID()}`, note: `Admin-recorded ${action} · ${reason}` }], { session });
+      res.locals.adjustedMember = { balance: user.walletBalance, available: user.walletBalance - user.reservedBalance };
+    });
+    res.json({ recorded: action, transactionCode, ...res.locals.adjustedMember });
+  } catch (e) { if (e.status) return res.status(e.status).json({ error: e.message }); throw e; }
+  finally { await session.endSession(); }
+});
+app.post('/api/admin/deposits/:id/approve', async (req,res) => {
+  if (!adminAuthorized(req)) return res.sendStatus(401);
+  if (req.body?.confirmedReceived !== true) return res.status(400).json({ error: 'Confirm that the M-Pesa deposit has arrived before crediting the wallet.' });
+  const session = await mongoose.startSession();
+  let depositTransactionCode;
+  try {
+    await session.withTransaction(async () => {
+      const deposit = await Deposit.findOneAndUpdate({ _id: req.params.id, status: 'pending' }, { $set: { status: 'paid' } }, { new: true, session });
+      if (!deposit) throw Object.assign(new Error('This deposit is no longer pending.'), { status: 409 });
+      depositTransactionCode = deposit.transactionCode || await reserveTransactionCode();
+      if (!deposit.transactionCode) await Deposit.updateOne({ _id: deposit._id }, { $set: { transactionCode: depositTransactionCode } }, { session });
+      const user = await User.updateOne({ _id: deposit.userId }, { $inc: { walletBalance: deposit.amount } }, { session });
+      if (!user.matchedCount) throw Object.assign(new Error('The account for this deposit no longer exists.'), { status: 404 });
+      await Entry.create([{ userId: deposit.userId, type: 'deposit', amount: deposit.amount, transactionCode: depositTransactionCode, reference: `dep:${deposit.reference}`, note: 'Kazi Yetu M-Pesa deposit' }], { session });
+    });
+    res.json({ approved: true, transactionCode: depositTransactionCode });
+  } catch (e) {
+    if (e.code === 11000) return res.status(409).json({ error: 'This transaction has already been recorded.' });
+    if (e.status) return res.status(e.status).json({ error: e.message });
+    throw e;
+  } finally { await session.endSession(); }
+});
+app.get('/api/public/withdrawals/recent', async (_req,res) => {
+  const rows=await Withdrawal.find({status:'paid'}).sort({createdAt:-1}).limit(8).select('amount transactionCode createdAt').lean();
+  // Unique opaque labels keep this real, verified payout feed private and non-repeating.
+  res.json({ withdrawals:rows.filter(row => row.amount <= 12000).map((row,index) => ({ amount: row.amount, transactionCode: row.transactionCode, createdAt: row.createdAt, member: `Kazi member ${String(index+1).padStart(2,'0')}` })) });
+});
+app.post('/api/payments/deposit', auth, async (req, res) => {
+  const amount = Number(req.body?.amount);
+  const phone = normalizePhone(req.body?.phone);
+  if (!Number.isSafeInteger(amount) || amount < 650 || amount > 100000) return res.status(400).json({ error: 'Deposits must be between KES 650 and KES 100,000.' });
+  if (!phoneOk(phone)) return res.status(400).json({ error: 'Enter a valid Kenyan M-Pesa number.' });
+  if (!paymentAccountId() || !paymentApiKey() || !paymentWebhookSecret()) return res.status(503).json({ error: 'Mobile money deposits are temporarily unavailable. Please contact support.' });
+  const reference = `KK-${crypto.randomUUID()}`;
+  const transactionCode=await reserveTransactionCode();
+  const deposit = await Deposit.create({ userId: req.user.id, amount, phone, reference, transactionCode });
+  let response, result;
+  try {
+    response = await fetch('https://api.hashback.co.ke/initiatestk', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ api_key: paymentApiKey(), account_id: paymentAccountId(), amount: String(amount), msisdn: phone, reference }), signal: AbortSignal.timeout(20000) });
+    result = await response.json();
+  } catch (e) {
+    // The payment service may have received the request despite a timeout; keep it pending to avoid a duplicate prompt.
+    return res.status(202).json({ reference, transactionCode: deposit.transactionCode, status: 'pending', message: 'Prompt status is not confirmed yet. Check your phone and wallet before trying again.' });
+  }
+  if (!response.ok || result.success !== true || !result.checkout_id) {
+    await Deposit.updateOne({ _id: deposit._id, status: 'pending' }, { $set: { status: 'failed' } });
+    return res.status(502).json({ error: 'The M-Pesa prompt could not be sent. Please try again later.' });
+  }
+  await Deposit.updateOne({ _id: deposit._id, status: 'pending' }, { $set: { checkoutId: String(result.checkout_id) } });
+  res.status(201).json({ reference, transactionCode: deposit.transactionCode, checkoutId: result.checkout_id, amount, phone, status: 'pending', message: 'M-Pesa prompt sent. Enter your PIN on your phone; your wallet updates after payment confirmation.' });
+});
+app.get('/api/payments/deposits/:reference', auth, async (req,res) => {
+  const deposit=await Deposit.findOne({reference:req.params.reference,userId:req.user.id}).select('reference transactionCode amount status checkoutId createdAt');
+  if(!deposit)return res.status(404).json({error:'Deposit order not found.'});
+  res.json(deposit);
+});
+// Verify signed callback bytes and the payment reference before crediting a wallet.
+app.post('/api/payments/callback', express.raw({ type: 'application/json', limit: '32kb' }), async (req, res) => {
+  const secret = paymentWebhookSecret();
+  const signature = req.get(['x','hash','pay','signature'].join('-')) || '';
+  const expected = `sha256=${crypto.createHmac('sha256', secret).update(req.body).digest('hex')}`;
+  const a = Buffer.from(signature), b = Buffer.from(expected);
+  if (!secret || a.length !== b.length || !crypto.timingSafeEqual(a, b)) return res.status(401).send('Invalid signature');
+  let event;
+  try { event = JSON.parse(req.body.toString('utf8')); } catch { return res.status(400).send('Invalid JSON'); }
+  if (event.event !== 'payment.success' || Number(event.ResponseCode) !== 0) return res.sendStatus(200);
+  const reference = String(event.TransactionReference || '');
+  const amount = Number(event.TransactionAmount);
+  if (!reference || !Number.isSafeInteger(amount) || !event.TransactionID) return res.sendStatus(400);
+  if (String(event.AccountID || '') !== String(paymentAccountId())) return res.sendStatus(200);
+  const session = await mongoose.startSession();
+  try {
+    await session.withTransaction(async () => {
+      const deposit = await Deposit.findOne({ reference, status: 'pending', amount }).session(session);
+      if (!deposit) return;
+      if (event.Msisdn && normalizePhone(event.Msisdn) !== normalizePhone(deposit.phone)) throw Object.assign(new Error('Phone mismatch'), { status: 400 });
+      const transactionCode = deposit.transactionCode || await reserveTransactionCode();
+      const claimed = await Deposit.findOneAndUpdate({ _id: deposit._id, status: 'pending', amount }, { $set: { status: 'paid', transactionCode, checkoutId: String(event.CheckoutRequestID || deposit.checkoutId || '') } }, { new: true, session });
+      if (!claimed) return;
+      await User.updateOne({ _id: claimed.userId }, { $inc: { walletBalance: amount } }, { session });
+      await Entry.create([{ userId: claimed.userId, type: 'deposit', amount, reference: `dep:${reference}`, transactionCode: claimed.transactionCode, note: 'Kazi Yetu M-Pesa deposit confirmed' }], { session });
+    });
+  } catch(e) { if(e.status===400)return res.status(400).send(e.message); throw e; }
+  finally { await session.endSession(); }
+  res.sendStatus(200);
+});
+app.post('/api/wallet/withdrawals', auth, async (req, res) => {
+  const amount = Number(req.body?.amount), profile = await User.findById(req.user.id).select('phone');
+  const phone = normalizePhone(req.body?.phone || profile?.phone);
+  if (!Number.isSafeInteger(amount) || amount < 1250 || amount > 12000) return res.status(400).json({ error: 'Withdrawals must be between KES 1,250 and KES 12,000.' });
+  if (!phoneOk(phone)) return res.status(400).json({ error: 'Enter a valid Kenyan mobile number.' });
+  if (!profile) return res.status(404).json({ error: 'Account not found.' });
+  const transactionCode=await reserveTransactionCode();
+  const session = await mongoose.startSession();
+  let withdrawal;
+  try {
+    await session.withTransaction(async () => {
+      const user = await User.findOneAndUpdate({ _id: req.user.id, $expr: { $gte: [{ $subtract: ['$walletBalance', '$reservedBalance'] }, amount] } }, { $inc: { reservedBalance: amount } }, { new: true, session });
+      if (!user) throw Object.assign(new Error('Your available balance is not enough for this withdrawal.'), { status: 400 });
+      [withdrawal] = await Withdrawal.create([{ userId: req.user.id, amount, phone, transactionCode }], { session });
+    });
+  } catch (e) { if (e.status === 400) return res.status(400).json({ error: e.message }); throw e; }
+  finally { await session.endSession(); }
+  res.status(201).json({ id: withdrawal.id, transactionCode: withdrawal.transactionCode, status: withdrawal.status, message: 'Withdrawal request submitted. It will appear as reserved while reviewed.' });
+});
+app.get('/api/admin/withdrawals', async (req, res) => {
+  if (!adminAuthorized(req)) return res.sendStatus(401);
+  const status = ['pending', 'processing'].includes(req.query.status) ? req.query.status : 'pending';
+  const rows = await Withdrawal.find({ status }).sort({ createdAt: 1 }).populate('userId', 'name email').limit(100);
+  res.json(rows);
+});
+app.post('/api/admin/withdrawals/:id/reconcile', async (req, res) => {
+  if (!adminAuthorized(req)) return res.sendStatus(401);
+  const outcome = req.body?.outcome;
+  if (!['paid', 'failed'].includes(outcome)) return res.status(400).json({ error: 'Set outcome to paid or failed after checking the payment status.' });
+  const session = await mongoose.startSession();
+  let transactionCode;
+  try {
+    await session.withTransaction(async () => {
+      const item = await Withdrawal.findOne({ _id: req.params.id, status: 'processing' }).session(session);
+      if (!item) throw Object.assign(new Error('No withdrawal awaiting reconciliation was found.'), { status: 404 });
+      if (!item.transactionCode) item.transactionCode = await reserveTransactionCode();
+      transactionCode = item.transactionCode;
+      item.status = outcome;
+      await item.save({ session });
+      if (outcome === 'paid') {
+        await User.updateOne({ _id: item.userId }, { $inc: { walletBalance: -item.amount, reservedBalance: -item.amount } }, { session });
+        await Entry.create([{ userId: item.userId, type: 'withdrawal', amount: item.amount, reference: `wd:${item.id}`, transactionCode: item.transactionCode, note: 'Kazi Yetu withdrawal sent' }], { session });
+      } else {
+        await User.updateOne({ _id: item.userId }, { $inc: { reservedBalance: -item.amount } }, { session });
+      }
+    });
+    res.json({ status: outcome, transactionCode });
+  } catch (e) { if (e.status) return res.status(e.status).json({ error: e.message }); throw e; }
+  finally { await session.endSession(); }
+});
+app.post('/api/admin/withdrawals/:id/pay', async (req, res) => {
+  if (!adminAuthorized(req)) return res.sendStatus(401);
+  if (!paymentApiKey() || !paymentSecurityCredential()) return res.status(503).json({ error: 'Withdrawal processing is not configured yet.' });
+  const item = await Withdrawal.findOneAndUpdate({ _id: req.params.id, status: 'pending' }, { $set: { status: 'processing' } }, { new: true });
+  if (!item) return res.status(409).json({ error: 'Request is unavailable or already being processed.' });
+  if (!item.transactionCode) { item.transactionCode=await reserveTransactionCode(); await Withdrawal.updateOne({ _id:item._id }, { $set:{ transactionCode:item.transactionCode } }); }
+  try {
+    const response = await fetch('https://api.hashback.co.ke/V2/processwithdrawal', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ api_key: paymentApiKey(), msisdn: item.phone, amount: item.amount, SecurityCredential: paymentSecurityCredential() }) });
+    const result = await response.json();
+    if (!response.ok || result.success !== true) {
+      const session = await mongoose.startSession();
+      try { await session.withTransaction(async () => { await Withdrawal.updateOne({ _id: item._id, status: 'processing' }, { $set: { status: 'failed' } }, { session }); await User.updateOne({ _id: item.userId }, { $inc: { reservedBalance: -item.amount } }, { session }); }); } finally { await session.endSession(); }
+      return res.status(502).json({ error: 'The withdrawal could not be processed. Please try again later.' });
+    }
+    const session = await mongoose.startSession();
+    try { await session.withTransaction(async () => {
+      await Withdrawal.updateOne({ _id: item._id, status: 'processing' }, { $set: { status: 'paid' } }, { session });
+      await User.updateOne({ _id: item.userId }, { $inc: { walletBalance: -item.amount, reservedBalance: -item.amount } }, { session });
+      await Entry.create([{ userId: item.userId, type: 'withdrawal', amount: item.amount, reference: `wd:${item.id}`, transactionCode: item.transactionCode, note: 'Kazi Yetu withdrawal sent' }], { session });
+    }); } finally { await session.endSession(); }
+    res.json({ status: 'paid', transactionCode: item.transactionCode });
+  } catch (e) {
+    // A timeout may happen after the transfer was sent. Keep the request reserved and in processing for reconciliation; never auto-retry an ambiguous payout.
+    res.status(502).json({ error: 'Payout status is uncertain. The request remains reserved for manual reconciliation; do not retry until its status is checked.' });
+  }
+});
+
+app.get('*', (_req, res) => res.sendFile(require('path').join(__dirname, 'public', 'index.html')));
+app.use((err, req, res, _next) => {
+  console.error(`${req.method} ${req.originalUrl} failed:`, err.name, err.message);
+  const databaseUnavailable = err.name?.startsWith('Mongo') || err.name?.startsWith('Mongoose') || mongoose.connection.readyState !== 1;
+  if (databaseUnavailable) return res.status(503).json({ error: 'Kazi Kenya data service is temporarily unavailable. Please retry shortly.' });
+  res.status(500).json({ error: 'Something went wrong. Please try again.' });
+});
+
+async function start() {
+  if (!process.env.MONGODB_URI || !process.env.JWT_SECRET) throw new Error('MONGODB_URI and JWT_SECRET are required.');
+  await mongoose.connect(process.env.MONGODB_URI, { serverSelectionTimeoutMS: 15000 });
+  await Promise.all([TransactionCode.init(), Deposit.init(), Withdrawal.init(), Entry.init()]);
+  await backfillTransactionCodes();
+  const port = Number(process.env.PORT || 10000);
+  app.listen(port, '0.0.0.0', () => console.log(`Kazi Kenya listening on ${port}`));
+}
+start().catch(e => { console.error('Startup failed:', e.message); process.exit(1); });
+
+function normalizePhone(value) { const n=String(value||'').replace(/[\s-]/g,''); return n.startsWith('+254')?n.slice(1):n.startsWith('0')?`254${n.slice(1)}`:n; }
+function shuffle(items) { for(let i=items.length-1;i>0;i--){const j=crypto.randomInt(i+1);[items[i],items[j]]=[items[j],items[i]];}return items; }

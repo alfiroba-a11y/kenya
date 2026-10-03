@@ -1,30 +1,27 @@
 services:
   - type: web
-    name: xcrow
+    name: kazi-kenya
     runtime: node
+    plan: free
     buildCommand: npm install
     startCommand: npm start
-    healthCheckPath: /health
+    healthCheckPath: /api/health
     envVars:
-      - key: HASHPAY_API_KEY
-        sync: false
-      - key: HASHPAY_ACCOUNT_ID
-        sync: false
-      - key: HASHPAY_ORGANIZATION_ID
-        sync: false
-      - key: HASHPAY_WEBHOOK_SECRET
-        sync: false
-      - key: MONGO_URI
+      - key: MONGODB_URI
         sync: false
       - key: JWT_SECRET
         generateValue: true
-      - key: ADMIN_EMAILS
-        sync: false
+      - key: ADMIN_EMAIL
+        value: Kiokok614@gmail.com
       - key: ADMIN_PASSWORD
         sync: false
-      - key: ADMIN_NAME
-        value: XCROW Administrator
-      - key: KES_PAYMENT_INSTRUCTIONS
+      - key: ADMIN_PATH
+        value: /kz-control-7c91e6d204f5b8a14c3d2e60
+      - key: PAYMENT_ACCOUNT_ID
         sync: false
-      - key: USD_KES_RATE
-        value: "130"
+      - key: PAYMENT_API_KEY
+        sync: false
+      - key: PAYMENT_WEBHOOK_SECRET
+        sync: false
+      - key: PAYMENT_SECURITY_CREDENTIAL
+        sync: false
