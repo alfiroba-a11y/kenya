@@ -1,6 +1,6 @@
 # Kazi Kenya
 
-Kazi Kenya is a Kenya-focused online-work skills hub with 19 workspaces. Each has six job-focused levels of 10 questions. Question order and answer choices are randomized. Every level is locked until confirmed deposits total KES 650 and at least KES 650 is currently available; progress is saved per account in MongoDB. Quiz scores add non-cash skill points.
+Kazi Kenya is a Kenya-focused online-work skills hub with 19 workspaces. Each has six job-focused levels of 10 questions. Question order and answer choices are randomized. Every level is locked until confirmed deposits total KES 650 and at least KES 650 is currently available; progress is saved per account in MongoDB. Quiz scores add skill points. Admins verify eligible points as pending work earnings, then separately confirm them as available in the wallet (1 point = KES 1). Withdrawals unlock automatically at KES 1,250 available.
 
 ## Deploy on Render
 1. Push this folder to GitHub and create a Render **Web Service** from the repository. Runtime: Node. Build command: `npm install`; start command: `npm start`.

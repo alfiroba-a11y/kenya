@@ -31,6 +31,8 @@ const entrySchema = new mongoose.Schema({ userId: { type: mongoose.Schema.Types.
 const Entry = mongoose.model('Entry', entrySchema);
 const transactionCodeSchema = new mongoose.Schema({ code: { type: String, unique: true, required: true }, createdAt: { type: Date, default: Date.now } });
 const TransactionCode = mongoose.model('TransactionCode', transactionCodeSchema);
+const workEarningSchema = new mongoose.Schema({ userId: { type: mongoose.Schema.Types.ObjectId, required: true, index: true }, skillPoints: { type: Number, required: true }, amount: { type: Number, required: true }, status: { type: String, enum: ['pending', 'available'], default: 'pending', index: true }, reference: { type: String, required: true, unique: true }, verifiedAt: { type: Date, default: Date.now }, availableAt: Date });
+const WorkEarning = mongoose.model('WorkEarning', workEarningSchema);
 async function reserveTransactionCode() {
   for (let attempt = 0; attempt < 5; attempt++) {
     const code = makeTransactionCode();
@@ -198,13 +200,16 @@ app.post('/api/workspaces/:slug/levels/:level/complete', auth, async (req, res) 
 async function walletSummary(userId) {
   const user = await User.findById(userId).select('walletBalance reservedBalance skillPoints');
   if (!user) throw new Error('Account not found.');
-  const [paidDeposits, earnings] = await Promise.all([
+  const [paidDeposits, earnings, verifiedPoints, pendingEarnings, verifiedWork] = await Promise.all([
     Deposit.aggregate([{ $match: { userId: user._id, status: 'paid' } }, { $group: { _id: null, total: { $sum: '$amount' } } }]),
-    Entry.aggregate([{ $match: { userId: user._id, type: 'earning' } }, { $group: { _id: null, total: { $sum: '$amount' } } }])
+    Entry.aggregate([{ $match: { userId: user._id, type: 'earning', reference: { $not: /^work-earning:/ } } }, { $group: { _id: null, total: { $sum: '$amount' } } }]),
+    WorkEarning.aggregate([{ $match: { userId: user._id } }, { $group: { _id: null, total: { $sum: '$skillPoints' } } }]),
+    WorkEarning.aggregate([{ $match: { userId: user._id, status: 'pending' } }, { $group: { _id: null, total: { $sum: '$amount' } } }]),
+    WorkEarning.aggregate([{ $match: { userId: user._id } }, { $group: { _id: null, total: { $sum: '$amount' } } }])
   ]);
   const deposited = paidDeposits[0]?.total || 0, available = user.walletBalance - user.reservedBalance;
   const depositToUnlock = deposited < 650 ? 650 - deposited : Math.max(0, 650 - available);
-  return { balance: user.walletBalance, available, pendingWithdrawals: user.reservedBalance, totalDeposited: deposited, verifiedEarnings: earnings[0]?.total || 0, skillPoints: user.skillPoints || 0, depositToUnlock, accessProgress: Math.min(100, Math.floor(available / 650 * 100)), withdrawalGap: Math.max(0, 1250 - available), assessmentsUnlocked: deposited >= 650 && available >= 650 };
+  return { balance: user.walletBalance, available, pendingWithdrawals: user.reservedBalance, totalDeposited: deposited, verifiedEarnings: (earnings[0]?.total || 0) + (verifiedWork[0]?.total || 0), pendingVerifiedEarnings: pendingEarnings[0]?.total || 0, skillPoints: user.skillPoints || 0, verifiedSkillPoints: verifiedPoints[0]?.total || 0, depositToUnlock, accessProgress: Math.min(100, Math.floor(available / 650 * 100)), withdrawalGap: Math.max(0, 1250 - available), assessmentsUnlocked: deposited >= 650 && available >= 650 };
 }
 app.get('/api/wallet', auth, async (req, res) => res.json(await walletSummary(req.user.id)));
 app.get('/api/wallet/transactions', auth, async (req, res) => {
@@ -251,7 +256,47 @@ app.get('/api/admin/overview', async (req,res) => {
     Deposit.find({ status: 'pending' }).sort({ createdAt: 1 }).limit(100).populate('userId', 'name email phone').lean(),
     Withdrawal.find({ status: { $in: ['pending', 'processing'] } }).sort({ createdAt: 1 }).limit(100).populate('userId', 'name email phone').lean()
   ]);
-  res.json({ members, memberCount, page, pageSize, pendingDeposits, pendingWithdrawals });
+  const [earningRows, pendingWorkEarnings] = await Promise.all([
+    WorkEarning.aggregate([{ $match: { userId: { $in: members.map(m => m._id) } } }, { $group: { _id: '$userId', verifiedSkillPoints: { $sum: '$skillPoints' }, pendingAmount: { $sum: { $cond: [{ $eq: ['$status', 'pending'] }, '$amount', 0] } } } }]),
+    WorkEarning.find({ status: 'pending' }).sort({ verifiedAt: 1 }).limit(100).populate('userId', 'name email').lean()
+  ]);
+  const earningByUser = new Map(earningRows.map(row => [String(row._id), row]));
+  res.json({ members: members.map(m => ({ ...m, verifiedSkillPoints: earningByUser.get(String(m._id))?.verifiedSkillPoints || 0, pendingVerifiedEarnings: earningByUser.get(String(m._id))?.pendingAmount || 0 })), memberCount, page, pageSize, pendingDeposits, pendingWithdrawals, pendingWorkEarnings });
+});
+app.post('/api/admin/members/:id/verify-skills', async (req,res) => {
+  if (!adminAuthorized(req)) return res.sendStatus(401);
+  if (!mongoose.isValidObjectId(req.params.id)) return res.status(404).json({ error: 'Member not found.' });
+  const skillPoints = Number(req.body?.skillPoints);
+  if (!Number.isSafeInteger(skillPoints) || skillPoints < 1 || skillPoints > 1000000) return res.status(400).json({ error: 'Enter a whole number of skill points to verify.' });
+  const session = await mongoose.startSession(); let earning;
+  try {
+    await session.withTransaction(async () => {
+      const user = await User.findById(req.params.id).select('skillPoints').session(session);
+      if (!user) throw Object.assign(new Error('Member not found.'), { status: 404 });
+      const rows = await WorkEarning.aggregate([{ $match: { userId: user._id } }, { $group: { _id: null, verified: { $sum: '$skillPoints' } } }]).session(session);
+      const remaining = Math.max(0, (user.skillPoints || 0) - (rows[0]?.verified || 0));
+      if (skillPoints > remaining) throw Object.assign(new Error(`Only ${remaining.toLocaleString()} unverified skill points remain.`), { status: 409 });
+      [earning] = await WorkEarning.create([{ userId: user._id, skillPoints, amount: skillPoints, reference: `skill-verify:${crypto.randomUUID()}` }], { session });
+    });
+    res.status(201).json({ verified: true, earningId: earning.id, skillPoints: earning.skillPoints, amount: earning.amount, status: earning.status });
+  } catch (e) { if (e.status) return res.status(e.status).json({ error: e.message }); throw e; }
+  finally { await session.endSession(); }
+});
+app.post('/api/admin/work-earnings/:id/confirm-available', async (req,res) => {
+  if (!adminAuthorized(req)) return res.sendStatus(401);
+  if (!mongoose.isValidObjectId(req.params.id)) return res.status(404).json({ error: 'Verified work earning not found.' });
+  const session = await mongoose.startSession(); let transactionCode, amount;
+  try {
+    await session.withTransaction(async () => {
+      const earning = await WorkEarning.findOneAndUpdate({ _id: req.params.id, status: 'pending' }, { $set: { status: 'available', availableAt: new Date() } }, { new: true, session });
+      if (!earning) throw Object.assign(new Error('This verified earning is already available or no longer exists.'), { status: 409 });
+      amount = earning.amount; transactionCode = await reserveTransactionCode();
+      await User.updateOne({ _id: earning.userId }, { $inc: { walletBalance: amount } }, { session });
+      await Entry.create([{ userId: earning.userId, type: 'earning', amount, transactionCode, reference: `work-earning:${earning.reference}`, note: `${earning.skillPoints.toLocaleString()} skill points approved as available work earnings` }], { session });
+    });
+    res.json({ available: true, amount, transactionCode });
+  } catch (e) { if (e.code === 11000) return res.status(409).json({ error: 'This earning was already recorded.' }); if (e.status) return res.status(e.status).json({ error: e.message }); throw e; }
+  finally { await session.endSession(); }
 });
 app.get('/api/admin/settings', async (req,res) => {
   if (!adminAuthorized(req)) return res.sendStatus(401);
@@ -260,7 +305,7 @@ app.get('/api/admin/settings', async (req,res) => {
 app.patch('/api/admin/settings', async (req,res) => {
   if (!adminAuthorized(req)) return res.sendStatus(401);
   const skillPointsPerCorrect = Number(req.body?.skillPointsPerCorrect), difficultyMultipliers = req.body?.difficultyMultipliers;
-  if (!Number.isInteger(skillPointsPerCorrect) || skillPointsPerCorrect < 20 || skillPointsPerCorrect > 1000 || !Array.isArray(difficultyMultipliers) || difficultyMultipliers.length !== 6 || difficultyMultipliers.some(n => typeof n !== 'number' || !Number.isFinite(n) || n < 1 || n > 10)) return res.status(400).json({ error: 'Set at least 20 non-cash skill points per correct answer and six difficulty multipliers (1–10).' });
+  if (!Number.isInteger(skillPointsPerCorrect) || skillPointsPerCorrect < 20 || skillPointsPerCorrect > 1000 || !Array.isArray(difficultyMultipliers) || difficultyMultipliers.length !== 6 || difficultyMultipliers.some(n => typeof n !== 'number' || !Number.isFinite(n) || n < 1 || n > 10)) return res.status(400).json({ error: 'Set at least 20 skill points per correct answer and six difficulty multipliers (1–10).' });
   const settings = await QuizSettings.findOneAndUpdate({ key: 'main' }, { $set: { skillPointsPerCorrect, difficultyMultipliers, updatedAt: new Date() } }, { new: true, upsert: true, runValidators: true });
   res.json({ skillPointsPerCorrect: settings.skillPointsPerCorrect, difficultyMultipliers: settings.difficultyMultipliers });
 });
