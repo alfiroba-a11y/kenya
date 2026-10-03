@@ -162,7 +162,8 @@ app.post('/api/auth/login', authLimit, async (req, res) => {
     res.status(503).json({ error: 'Sign-in is temporarily unavailable while the member database reconnects. Please try again shortly.' });
   }
 });
-function issueToken(user) { return { token: jwt.sign({ id: user.id, name: user.name, email: user.email, portalId: PORTAL_ID }, process.env.JWT_SECRET, { expiresIn: '7d' }), user: { name: user.name, username: user.username, email: user.email } }; }
+function issueToken(user) { return { token: jwt.sign({ id: user.id, name: user.name, email: user.email, portalId: PORTAL_ID }, process.env.JWT_SECRET, { expiresIn: '1h' }), user: { name: user.name, username: user.username, email: user.email } }; }
+app.post('/api/auth/refresh', auth, authLimit, async (req,res) => { const user=await User.findOne({ _id:req.user.id, portalId:PORTAL_ID }).select('name username email'); if(!user)return res.status(404).json({error:'Account not found.'}); res.json(issueToken(user)); });
 app.get('/api/me', auth, async (req, res) => { const user = await User.findOne({ _id: req.user.id, portalId: PORTAL_ID }).select('name username email phone'); if (!user) return res.status(404).json({ error: 'Account not found.' }); res.json({ user }); });
 app.patch('/api/profile', auth, async (req,res) => {
   const name=String(req.body?.name||'').trim(),username=String(req.body?.username||'').trim().toLowerCase();

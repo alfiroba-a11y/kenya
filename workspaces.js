@@ -66,16 +66,122 @@ const roleActions={
 'house-review':'Compare the listing with the available evidence, record discrepancies, and label unverified claims clearly.',
 'transcriptionist':'Replay unclear sections, follow the transcription style guide, and mark uncertainty rather than inventing words.'
 };
+const CHALLENGES = [
+  [
+    'A new assignment arrives with a short brief and a clear deadline.',
+    'A client supplies a reference example before the work begins.',
+    'The instructions name a specific format for the final file.',
+    'A task includes a detail that must be checked against its source.',
+    'You are asked to complete a familiar task using a new checklist.',
+    'The assignment includes one unfamiliar term and otherwise clear steps.',
+    'A handoff note explains what the next person needs to receive.',
+    'A simple task has a required quality check before submission.',
+    'The client describes the intended result but not every small step.',
+    'You have to decide which written instruction applies to the task.'
+  ],
+  [
+    'Two source records show different values for the same detail.',
+    'A work item appears twice with slightly different spelling.',
+    'A date is present, but its format differs from the rest of the file.',
+    'A supporting image does not match the written description.',
+    'One required field is blank while the remaining fields are complete.',
+    'A draft contains a claim that has no supporting source attached.',
+    'A response appears inconsistent with an earlier answer in the same task.',
+    'A file name does not match the agreed naming convention.',
+    'A copied value may have shifted into the neighbouring row.',
+    'A reviewer flags a detail that the original checklist does not mention.'
+  ],
+  [
+    'A task moves from intake to review and then to a client handoff.',
+    'The approved checklist requires a source check before data entry.',
+    'A teammate needs a short status update before taking the next step.',
+    'The client asks for the result in a reusable, clearly labelled format.',
+    'A recurring task must be completed consistently across several records.',
+    'You need to keep a record of which items have passed quality review.',
+    'A new tool is available, but the team has not approved it for this task.',
+    'A delivery includes both a finished result and a note about limitations.',
+    'A queue contains urgent and routine items with different deadlines.',
+    'A task must be handed over without losing its source references.'
+  ],
+  [
+    'The only supplied source is temporarily unavailable.',
+    'A client changes one requirement after work has started.',
+    'A tool produces an incomplete result that needs human review.',
+    'The deadline is at risk because an earlier dependency is delayed.',
+    'Two instructions conflict and neither identifies its priority.',
+    'A quality check finds an error in an item already marked complete.',
+    'A request arrives that is outside the access granted to your account.',
+    'The expected output cannot be produced from the evidence supplied.',
+    'A teammate reports a possible safety or privacy concern.',
+    'A system outage interrupts a task that has not yet been saved.'
+  ],
+  [
+    'A stranger asks you to share a customer record through a personal chat.',
+    'A client asks you to claim that an unchecked detail is confirmed.',
+    'A message contains sensitive information that is not needed for the task.',
+    'A deadline is missed and the client has not received an update.',
+    'A request asks you to use another worker’s login credentials.',
+    'A public comment includes a threat that requires careful escalation.',
+    'A task asks for personal details beyond the stated purpose.',
+    'A reviewer asks you to conceal a mistake in a completed deliverable.',
+    'You cannot verify a claim before the planned handoff time.',
+    'A client asks for work that conflicts with the published task rules.'
+  ],
+  [
+    'A client needs a checked deliverable, a clear status, and a safe handoff today.',
+    'A batch is almost complete when a source discrepancy affects several records.',
+    'A teammate is waiting on your result, but one important fact remains uncertain.',
+    'A priority change affects the schedule and the quality checks already planned.',
+    'The final file is ready, but its evidence and limitations are not yet documented.',
+    'A user reports a problem that may affect both accuracy and personal data.',
+    'A deadline, an incomplete source, and a required review all overlap.',
+    'A completed item needs correction and a transparent explanation to the client.',
+    'A high-priority request arrives through an unapproved channel.',
+    'You must decide whether to deliver, clarify, or escalate an unresolved issue.'
+  ]
+];
+
+const QUESTION_OPTIONS = [
+  ['Follow the approved guidance, verify the source, and communicate uncertainty clearly.', 'Guess the missing detail and submit without checking.', 'Ignore the task requirements to finish faster.', 'Share private information through an unapproved channel.'],
+  ['Check the source, record the discrepancy, and resolve it before marking the work complete.', 'Choose whichever value looks more plausible.', 'Delete the conflicting evidence and continue.', 'Copy the same unverified value into every record.'],
+  ['Use the approved workflow, preserve references, and make the handoff clear.', 'Skip required review steps to save time.', 'Use an unapproved tool without telling the task owner.', 'Send an unlabeled result with no supporting context.'],
+  ['Pause the affected work, document the blocker, and ask the right owner for guidance.', 'Invent a workaround and hide the change.', 'Mark the task complete despite the blocker.', 'Share account credentials to get around the issue.'],
+  ['Protect the information, follow the published rules, and escalate when needed.', 'Comply with the request regardless of policy.', 'Forward sensitive details to a personal account.', 'Conceal the issue from the people responsible.'],
+  ['Prioritize safely, verify what can be verified, and give a transparent status and handoff.', 'Promise a result you cannot support with evidence.', 'Skip safeguards and hide the remaining uncertainty.', 'Close the task without telling the next person about the blocker.']
+];
+
 function getQuestions(slug, level) {
-  const workspace = W.find(w=>w.slug===slug); if(!workspace) return null;
-  const bank = BANKS[slug] || (()=>{
-    const focus=workspace.focus.split(', ').filter(Boolean), action=roleActions[slug]||'Follow the task guidance, check the result against evidence, and report uncertainty honestly.';
-    const options=[action,'Guess missing details and submit without checking.','Ignore the task guidance when it slows you down.','Share private information in an unapproved channel.'];
-    return Array.from({length:10},(_,i)=>{const skill=focus[Math.floor(i/2)%focus.length],prompt=i%2===0?`How should you handle ${skill} as a ${workspace.title}?`:`Before submitting ${workspace.title} work involving ${skill}, what is the best check?`;return[prompt,options,0]});
-  })();
-  const stage = LEVELS[level-1];
-  const focus=workspace.focus.split(', ').filter(Boolean);
-  const situations=['on a first assignment','during a busy workday','while using your usual tools','when an unexpected issue appears','when handling a sensitive detail','during your final handoff'];
-  return bank.map((item,i)=>({ id:`${slug}-l${level}-q${i+1}`, prompt:`Level ${level} · ${stage} · ${situations[level-1]}: ${workspace.title} — ${focus[i%focus.length]}. ${item[0]}`, choices:item[1], correct:item[2] }));
+  const workspace = W.find(w=>w.slug===slug);
+  if(!workspace || !Number.isInteger(level) || level < 1 || level > 6) return null;
+  const skills=workspace.focus.split(', ').filter(Boolean);
+  const action=roleActions[slug]||'Follow the task guidance, check the result against evidence, and report uncertainty honestly.';
+  // The original domain-authored bank is used only for Level 1. Higher levels
+  // have separate case-based prompts and never reuse or reorder that bank.
+  const bank=BANKS[slug];
+  return Array.from({length:10},(_,i)=>{
+    const id=`${slug}-l${level}-q${i+1}`;
+    let prompt,choices,correct;
+    if(level===1 && bank){ [prompt,choices,correct]=bank[i]; }
+    else {
+      const skill=skills[(i*3+(level-1))%skills.length];
+      const caseText=CHALLENGES[level-1][i];
+      const frame=[
+        `For ${workspace.title}, which first step best establishes reliable ${skill} when ${caseText.toLowerCase()}`,
+        `You are checking ${skill} in a ${workspace.title} task: ${caseText} What should be resolved before sign-off?`,
+        `A ${workspace.title} workflow involving ${skill} reaches this point: ${caseText} Which process is the soundest choice?`,
+        `While handling ${skill} as a ${workspace.title}, this blocker appears: ${caseText} What is the safest next action?`,
+        `A professional ${workspace.title} worker encounters this concern about ${skill}: ${caseText} How should it be handled?`,
+        `Job-ready case for ${workspace.title} — ${skill}: ${caseText} Which response best protects quality and the handoff?`
+      ][level-1];
+      prompt=frame;
+      choices=QUESTION_OPTIONS[level-1];
+      correct=0;
+    }
+    // Level 1 banks sometimes share generic text. Include the role in its prompt
+    // so question identity remains distinct between workspaces as well.
+    if(level===1) prompt=`${workspace.title}: ${prompt}`;
+    if(!choices || choices.length!==4 || !Number.isInteger(correct)) throw new Error(`Invalid question data for ${id}`);
+    return {id,prompt,choices,correct};
+  });
 }
 module.exports={WORKSPACES:W,LEVELS,getQuestions};
