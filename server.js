@@ -23,7 +23,7 @@ const paymentAccountId = () => process.env.PAYMENT_ACCOUNT_ID || process.env['HA
 const paymentApiKey = () => process.env.PAYMENT_API_KEY || process.env['HASH'+'PAY_API_KEY'] || '';
 const paymentWebhookSecret = () => process.env.PAYMENT_WEBHOOK_SECRET || process.env['HASH'+'PAY_WEBHOOK_SECRET'] || '';
 const paymentSecurityCredential = () => process.env.PAYMENT_SECURITY_CREDENTIAL || process.env['HASH'+'PAY_SECURITY_CREDENTIAL'] || '';
-const userSchema = new mongoose.Schema({ portalId: { type: String, required: true, default: PORTAL_ID }, name: { type: String, required: true, trim: true, maxlength: 80 }, username: { type: String, lowercase: true, trim: true }, email: { type: String, required: true, lowercase: true, trim: true }, phone: { type: String, required: true }, password: { type: String, required: true }, walletBalance: { type: Number, default: 0 }, reservedBalance: { type: Number, default: 0 }, readyToWithdraw: { type: Number, default: 0 }, skillPoints: { type: Number, default: 0 }, createdAt: { type: Date, default: Date.now } });
+const userSchema = new mongoose.Schema({ portalId: { type: String, required: true, default: PORTAL_ID }, name: { type: String, required: true, trim: true, maxlength: 80 }, username: { type: String, lowercase: true, trim: true }, email: { type: String, required: true, lowercase: true, trim: true }, phone: { type: String, required: true }, password: { type: String, required: true }, walletBalance: { type: Number, default: 0 }, reservedBalance: { type: Number, default: 0 }, readyToWithdraw: { type: Number, default: 0 }, skillPoints: { type: Number, default: 0 }, unlockPoints: { type: Number, default: 0 }, walletModelVersion: { type: Number, default: 0 }, createdAt: { type: Date, default: Date.now } });
 userSchema.index({ portalId: 1, email: 1 }, { unique: true, name: 'portal_email_unique' });
 userSchema.index({ portalId: 1, username: 1 }, { unique: true, partialFilterExpression: { username: { $type: 'string' } }, name: 'portal_username_unique' });
 const User = mongoose.model('User', userSchema, PORTAL_USER_COLLECTION);
@@ -89,11 +89,25 @@ async function preparePortalUsers() {
       catch (error) { if (error.code !== 11000) throw error; }
     }
   }
-  for (const [field, value] of [['walletBalance', 0], ['reservedBalance', 0], ['readyToWithdraw', 0], ['skillPoints', 0]]) {
+  for (const [field, value] of [['walletBalance', 0], ['reservedBalance', 0], ['readyToWithdraw', 0], ['skillPoints', 0], ['unlockPoints', 0], ['walletModelVersion', 0]]) {
     await User.updateMany({ portalId: PORTAL_ID, [field]: { $exists: false } }, { $set: { [field]: value } });
   }
+  // Convert the old mixed deposit/work balance once: unused deposit funds become
+  // level points; only verified-work money remains in the withdrawable wallet.
+  for (const member of await User.find({ portalId: PORTAL_ID, walletModelVersion: { $lt: 2 } }).select('_id walletBalance reservedBalance readyToWithdraw unlockPoints').lean()) {
+    const [paidDeposits, adminDeposits, withdrawals] = await Promise.all([
+      Deposit.aggregate([{ $match: { userId: member._id, status: 'paid' } }, { $group: { _id: null, total: { $sum: '$amount' } } }]),
+      Entry.aggregate([{ $match: { userId: member._id, type: 'deposit', reference: /^admin-deposit:/ } }, { $group: { _id: null, total: { $sum: '$amount' } } }]),
+      Entry.aggregate([{ $match: { userId: member._id, type: 'withdrawal' } }, { $group: { _id: null, total: { $sum: '$amount' } } }])
+    ]);
+    const deposits = (paidDeposits[0]?.total || 0) + (adminDeposits[0]?.total || 0);
+    const spentFromDeposit = Math.min(deposits, withdrawals[0]?.total || 0);
+    const remainingDeposit = deposits - spentFromDeposit;
+    const earningsBalance = Math.max(0, Number(member.walletBalance || 0) - remainingDeposit);
+    await User.updateOne({ _id: member._id, portalId: PORTAL_ID, walletModelVersion: { $lt: 2 } }, { $set: { walletBalance: earningsBalance, readyToWithdraw: Math.min(Number(member.readyToWithdraw || 0), earningsBalance), unlockPoints: Number(member.unlockPoints || 0) + deposits / 2, walletModelVersion: 2 } });
+  }
 }
-const progressSchema = new mongoose.Schema({ userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true, index: true }, workspace: { type: String, required: true }, levels: { type: [{ level: Number, completed: Boolean, score: Number, points: Number, completedAt: Date }], default: [] }, updatedAt: { type: Date, default: Date.now } });
+const progressSchema = new mongoose.Schema({ userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true, index: true }, workspace: { type: String, required: true }, levels: { type: [{ level: Number, unlocked: { type: Boolean, default: false }, unlockCost: Number, unlockedAt: Date, completed: Boolean, score: Number, points: Number, completedAt: Date }], default: [] }, updatedAt: { type: Date, default: Date.now } });
 progressSchema.index({ userId: 1, workspace: 1 }, { unique: true });
 const Progress = mongoose.model('Progress', progressSchema);
 const attemptSchema = new mongoose.Schema({ userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true, index: true }, workspace: { type: String, required: true }, level: { type: Number, required: true }, answers: [{ questionId: String, correctChoice: Number }], usedAt: Date, expiresAt: { type: Date, expires: 0 } });
@@ -136,7 +150,7 @@ app.post('/api/auth/register', authLimit, async (req, res) => {
   const hash = await bcrypt.hash(password, 12);
   for (let attempt = 0; attempt < 5; attempt++) {
     try {
-      const user = await User.create({ portalId: PORTAL_ID, name: name.trim(), username: `${usernameBase}_${crypto.randomInt(1000,9999)}`, email, phone: normalizePhone(phone), password: hash });
+      const user = await User.create({ portalId: PORTAL_ID, name: name.trim(), username: `${usernameBase}_${crypto.randomInt(1000,9999)}`, email, phone: normalizePhone(phone), password: hash, walletModelVersion: 2 });
       return res.status(201).json(issueToken(user));
     } catch (e) {
       if (e.code !== 11000) throw e;
@@ -190,11 +204,31 @@ app.get('/api/workspaces/progress', auth, async (req, res) => {
   const rows = await Progress.find({ userId: req.user.id }).select('workspace levels updatedAt');
   res.json({ progress: rows });
 });
+const LEVEL_UNLOCK_COST = Math.round((325 / (WORKSPACES.length * LEVELS.length)) * 1e6) / 1e6;
+function levelIsUnlocked(progress, level) { const row=progress?.levels?.find(item=>item.level===level); return !!(row?.unlocked || row?.completed); }
+app.post('/api/workspaces/:slug/levels/:level/unlock', auth, async (req,res) => {
+  const level=Number(req.params.level);
+  if(!WORKSPACES.some(w=>w.slug===req.params.slug)||!Number.isInteger(level)||level<1||level>6)return res.status(404).json({error:'Workspace or level not found.'});
+  const session=await mongoose.startSession();let result;
+  try{await session.withTransaction(async()=>{
+    let progress=await Progress.findOne({userId:req.user.id,workspace:req.params.slug}).session(session);
+    let row=progress?.levels.find(item=>item.level===level);
+    if(row?.unlocked||row?.completed){result={unlocked:true,alreadyUnlocked:true,unlockPoints:(await User.findOne({_id:req.user.id,portalId:PORTAL_ID}).select('unlockPoints').session(session)).unlockPoints||0,unlockCost:LEVEL_UNLOCK_COST};return}
+    const account=await User.findOneAndUpdate({_id:req.user.id,portalId:PORTAL_ID,unlockPoints:{$gte:LEVEL_UNLOCK_COST}},{$inc:{unlockPoints:-LEVEL_UNLOCK_COST}},{new:true,session}).select('unlockPoints');
+    if(!account)throw Object.assign(new Error('Not enough level points. A confirmed KES 650 deposit adds 325 points. Choose a smaller set of levels or deposit again.'),{status:409});
+    if(!progress)progress=new Progress({userId:req.user.id,workspace:req.params.slug,levels:[]});
+    row=progress.levels.find(item=>item.level===level);
+    if(row){row.unlocked=true;row.unlockCost=LEVEL_UNLOCK_COST;row.unlockedAt=new Date()}else progress.levels.push({level,unlocked:true,unlockCost:LEVEL_UNLOCK_COST,unlockedAt:new Date(),completed:false,score:0,points:0});
+    progress.updatedAt=new Date();await progress.save({session});
+    result={unlocked:true,alreadyUnlocked:false,unlockCost:LEVEL_UNLOCK_COST,unlockPoints:account.unlockPoints};
+  })}catch(e){if(e.status)return res.status(e.status).json({error:e.message});throw e}finally{await session.endSession()}
+  res.json(result);
+});
 app.get('/api/workspaces/:slug/levels/:level/questions', auth, async (req, res) => {
   const level = Number(req.params.level), questions = getQuestions(req.params.slug, level);
   if (!questions || !Number.isInteger(level) || level < 1 || level > 6) return res.status(404).json({ error: 'Workspace or level not found.' });
-  const wallet = await walletSummary(req.user.id);
-  if (!wallet.assessmentsUnlocked) return res.status(403).json({ error: wallet.totalDeposited < 650 ? 'Deposit at least KES 650 and wait for payment confirmation to unlock assessments.' : 'Your available balance must be at least KES 650 to access assessments. Deposit again to unlock them.' });
+  const progress=await Progress.findOne({userId:req.user.id,workspace:req.params.slug}).select('levels').lean();
+  if(!levelIsUnlocked(progress,level))return res.status(403).json({error:`Unlock this level for ${LEVEL_UNLOCK_COST.toFixed(6)} points before starting.`});
   const order = shuffle([...questions]);
   const randomized = order.map(q => { const choices = shuffle(q.choices.map((text,index)=>({text,index}))); return { id:q.id, prompt:q.prompt, choices:choices.map(c=>c.text), correctChoice:choices.findIndex(c=>c.index===q.correct) }; });
   const attempt = await QuestionAttempt.create({ userId:req.user.id, workspace:req.params.slug, level, answers:randomized.map(q=>({questionId:q.id,correctChoice:q.correctChoice})), expiresAt:new Date(Date.now()+60*60*1000) });
@@ -209,10 +243,8 @@ app.post('/api/workspaces/:slug/levels/:level/complete', auth, async (req, res) 
   try {
     await session.withTransaction(async () => {
       let progress = await Progress.findOne({ userId: req.user.id, workspace: req.params.slug }).session(session);
-      const paid = await Deposit.aggregate([{ $match: { userId: new mongoose.Types.ObjectId(req.user.id), status: 'paid' } }, { $group: { _id: null, total: { $sum: '$amount' } } }]).session(session);
-      const account = await User.findOne({ _id: req.user.id, portalId: PORTAL_ID }).select('walletBalance reservedBalance').session(session);
-      const available = account ? account.walletBalance - account.reservedBalance : 0;
-      if ((paid[0]?.total || 0) < 650 || available < 650) throw Object.assign(new Error((paid[0]?.total || 0) < 650 ? 'Deposit at least KES 650 and wait for payment confirmation to unlock assessments.' : 'Your available balance must be at least KES 650 to access assessments. Deposit again to unlock them.'), { status: 403 });
+      const unlockedProgress=await Progress.findOne({userId:req.user.id,workspace:req.params.slug}).select('levels').session(session);
+      if(!levelIsUnlocked(unlockedProgress,level))throw Object.assign(new Error(`Unlock this level for ${LEVEL_UNLOCK_COST.toFixed(6)} points before starting.`),{status:403});
       const attempt = await QuestionAttempt.findOneAndUpdate({ _id:attemptId,userId:req.user.id,workspace:req.params.slug,level,usedAt:null,expiresAt:{$gt:new Date()} },{ $set:{usedAt:new Date()} },{new:true,session});
       if (!attempt || attempt.answers.length !== 10) throw Object.assign(new Error('This quiz attempt expired or was already submitted. Start the level again.'), { status: 409 });
       const score = attempt.answers.reduce((total, question, i) => total + (question.correctChoice === answers[i] ? 1 : 0), 0);
@@ -234,19 +266,21 @@ app.post('/api/workspaces/:slug/levels/:level/complete', auth, async (req, res) 
 });
 
 async function walletSummary(userId) {
-  const user = await User.findOne({ _id: userId, portalId: PORTAL_ID }).select('walletBalance reservedBalance readyToWithdraw skillPoints');
+  const user = await User.findOne({ _id: userId, portalId: PORTAL_ID }).select('walletBalance reservedBalance readyToWithdraw skillPoints unlockPoints');
   if (!user) throw new Error('Account not found.');
-  const [paidDeposits, earnings, verifiedPoints, pendingEarnings, verifiedWork] = await Promise.all([
+  const [paidDeposits, adminDeposits, earnings, verifiedPoints, pendingEarnings, verifiedWork] = await Promise.all([
     Deposit.aggregate([{ $match: { userId: user._id, status: 'paid' } }, { $group: { _id: null, total: { $sum: '$amount' } } }]),
+    Entry.aggregate([{ $match: { userId: user._id, type: 'deposit', reference: /^admin-deposit:/ } }, { $group: { _id: null, total: { $sum: '$amount' } } }]),
     Entry.aggregate([{ $match: { userId: user._id, type: 'earning', reference: { $not: /^work-earning:/ } } }, { $group: { _id: null, total: { $sum: '$amount' } } }]),
     WorkEarning.aggregate([{ $match: { userId: user._id } }, { $group: { _id: null, total: { $sum: '$skillPoints' } } }]),
     WorkEarning.aggregate([{ $match: { userId: user._id, status: 'pending' } }, { $group: { _id: null, total: { $sum: '$amount' } } }]),
     WorkEarning.aggregate([{ $match: { userId: user._id } }, { $group: { _id: null, total: { $sum: '$amount' } } }])
   ]);
-  const deposited = paidDeposits[0]?.total || 0, available = user.walletBalance - user.reservedBalance;
-  const depositToUnlock = deposited < 650 ? 650 - deposited : Math.max(0, 650 - available);
+  const deposited = (paidDeposits[0]?.total || 0) + (adminDeposits[0]?.total || 0), available = user.walletBalance - user.reservedBalance;
   const readyToWithdraw = Math.min(user.readyToWithdraw || 0, available);
-  return { balance: user.walletBalance, available, availableNow: user.walletBalance, readyToWithdraw, pendingWithdrawals: user.reservedBalance, totalDeposited: deposited, verifiedEarnings: (earnings[0]?.total || 0) + (verifiedWork[0]?.total || 0), pendingVerifiedEarnings: pendingEarnings[0]?.total || 0, skillPoints: user.skillPoints || 0, verifiedSkillPoints: verifiedPoints[0]?.total || 0, depositToUnlock, accessProgress: Math.min(100, Math.floor(available / 650 * 100)), withdrawalGap: Math.max(0, 1250 - readyToWithdraw), assessmentsUnlocked: deposited >= 650 && available >= 650 };
+  const progressRows=await Progress.find({userId:user._id}).select('levels').lean();
+  const levelsUnlocked=progressRows.reduce((sum,row)=>sum+row.levels.filter(level=>level.unlocked||level.completed).length,0);
+  return { balance: user.walletBalance, available, availableNow: user.walletBalance, readyToWithdraw, pendingWithdrawals: user.reservedBalance, totalDeposited: deposited, verifiedEarnings: (earnings[0]?.total || 0) + (verifiedWork[0]?.total || 0), pendingVerifiedEarnings: pendingEarnings[0]?.total || 0, skillPoints: user.skillPoints || 0, verifiedSkillPoints: verifiedPoints[0]?.total || 0, unlockPoints: user.unlockPoints || 0, unlockCost: LEVEL_UNLOCK_COST, levelsUnlocked, totalLevels: WORKSPACES.length*LEVELS.length, accessProgress: Math.min(100, Math.floor(levelsUnlocked / (WORKSPACES.length*LEVELS.length) * 100)), withdrawalGap: Math.max(0, 1250 - readyToWithdraw), assessmentsUnlocked: (user.unlockPoints || 0) >= LEVEL_UNLOCK_COST };
 }
 app.get('/api/wallet', auth, async (req, res) => res.json(await walletSummary(req.user.id)));
 app.get('/api/wallet/transactions', auth, async (req, res) => {
@@ -289,7 +323,7 @@ app.get('/api/admin/overview', async (req,res) => {
   const page = Math.max(1, Math.min(100000, Number.parseInt(req.query.page, 10) || 1)), pageSize = 50;
   const portalUserIds = await User.find({ portalId: PORTAL_ID }).distinct('_id');
   const [members, memberCount, pendingDeposits, pendingWithdrawals] = await Promise.all([
-    User.find({ portalId: PORTAL_ID }).sort({ createdAt: -1 }).skip((page - 1) * pageSize).limit(pageSize).select('name username email phone walletBalance reservedBalance readyToWithdraw skillPoints createdAt').lean(),
+    User.find({ portalId: PORTAL_ID }).sort({ createdAt: -1 }).skip((page - 1) * pageSize).limit(pageSize).select('name username email phone walletBalance reservedBalance readyToWithdraw skillPoints unlockPoints createdAt').lean(),
     User.countDocuments({ portalId: PORTAL_ID }),
     Deposit.find({ userId: { $in: portalUserIds }, status: 'pending' }).sort({ createdAt: 1 }).limit(100).populate('userId', 'name email phone').lean(),
     Withdrawal.find({ userId: { $in: portalUserIds }, status: { $in: ['pending', 'processing'] } }).sort({ createdAt: 1 }).limit(100).populate('userId', 'name email phone').lean()
@@ -367,10 +401,10 @@ app.post('/api/admin/members/:id/wallet-transactions', async (req,res) => {
   try {
     await session.withTransaction(async () => {
       const filter = direction === 'debit' ? { _id: req.params.id, portalId: PORTAL_ID, $expr: { $gte: [{ $subtract: ['$walletBalance', '$reservedBalance'] }, amount] } } : { _id: req.params.id, portalId: PORTAL_ID };
-      const delta = direction === 'credit' ? amount : -amount;
-      const user = await User.findOneAndUpdate({ ...filter, portalId: PORTAL_ID }, { $inc: { walletBalance: delta } }, { new: true, session });
+      const update = action === 'deposit' ? { $inc: { unlockPoints: amount / 2 } } : { $inc: { walletBalance: -amount } };
+      const user = await User.findOneAndUpdate({ ...filter, portalId: PORTAL_ID }, update, { new: true, session });
       if (!user) throw Object.assign(new Error(direction === 'debit' ? 'Member not found or debit exceeds the available balance.' : 'Member not found.'), { status: direction === 'debit' ? 409 : 404 });
-      await Entry.create([{ userId: user._id, type: action === 'deposit' ? 'deposit' : 'withdrawal', amount, direction, transactionCode, reference: `admin-${action}:${crypto.randomUUID()}`, note: `Admin-recorded ${action} · ${reason}` }], { session });
+      await Entry.create([{ userId: user._id, type: action === 'deposit' ? 'deposit' : 'withdrawal', amount, direction, transactionCode, reference: `admin-${action}:${crypto.randomUUID()}`, note: action === 'deposit' ? `${(amount/2).toLocaleString()} level points credited from an admin-recorded KES deposit · ${reason}` : `Admin-recorded withdrawal · ${reason}` }], { session });
       res.locals.adjustedMember = { balance: user.walletBalance, available: user.walletBalance - user.reservedBalance };
     });
     res.json({ recorded: action, transactionCode, ...res.locals.adjustedMember });
@@ -389,9 +423,9 @@ app.post('/api/admin/deposits/:id/approve', async (req,res) => {
       if (!deposit) throw Object.assign(new Error('This deposit is no longer pending.'), { status: 409 });
       depositTransactionCode = deposit.transactionCode || await reserveTransactionCode();
       if (!deposit.transactionCode) await Deposit.updateOne({ _id: deposit._id }, { $set: { transactionCode: depositTransactionCode } }, { session });
-      const user = await User.updateOne({ _id: deposit.userId, portalId: PORTAL_ID }, { $inc: { walletBalance: deposit.amount } }, { session });
+      const user = await User.updateOne({ _id: deposit.userId, portalId: PORTAL_ID }, { $inc: { unlockPoints: deposit.amount / 2 } }, { session });
       if (!user.matchedCount) throw Object.assign(new Error('The account for this deposit no longer exists.'), { status: 404 });
-      await Entry.create([{ userId: deposit.userId, type: 'deposit', amount: deposit.amount, transactionCode: depositTransactionCode, reference: `dep:${deposit.reference}`, note: 'Kazi Yetu M-Pesa deposit' }], { session });
+      await Entry.create([{ userId: deposit.userId, type: 'deposit', amount: deposit.amount, transactionCode: depositTransactionCode, reference: `dep:${deposit.reference}`, note: 'Deposit confirmed · '+(deposit.amount/2).toLocaleString()+' level points added' }], { session });
     });
     res.json({ approved: true, transactionCode: depositTransactionCode });
   } catch (e) {
@@ -428,7 +462,7 @@ app.post('/api/payments/deposit', auth, async (req, res) => {
     return res.status(502).json({ error: 'The M-Pesa prompt could not be sent. Please try again later.' });
   }
   await Deposit.updateOne({ _id: deposit._id, status: 'pending' }, { $set: { checkoutId: String(result.checkout_id) } });
-  res.status(201).json({ reference, transactionCode: deposit.transactionCode, checkoutId: result.checkout_id, amount, phone, status: 'pending', message: 'M-Pesa prompt sent. Enter your PIN on your phone; your wallet updates after payment confirmation.' });
+  res.status(201).json({ reference, transactionCode: deposit.transactionCode, checkoutId: result.checkout_id, amount, phone, status: 'pending', message: 'M-Pesa prompt sent. Enter your PIN on your phone; after confirmation, your deposit adds level points at KES 2 per point.' });
 });
 app.get('/api/payments/deposits/:reference', auth, async (req,res) => {
   const deposit=await Deposit.findOne({reference:req.params.reference,userId:req.user.id}).select('reference transactionCode amount status checkoutId createdAt');
@@ -460,8 +494,8 @@ app.post('/api/payments/callback', express.raw({ type: 'application/json', limit
       if (!claimed) return;
       const member = await User.exists({ _id: claimed.userId, portalId: PORTAL_ID }).session(session);
       if (!member) throw Object.assign(new Error('Kazi Kenya account not found for this deposit.'), { status: 404 });
-      await User.updateOne({ _id: claimed.userId, portalId: PORTAL_ID }, { $inc: { walletBalance: amount } }, { session });
-      await Entry.create([{ userId: claimed.userId, type: 'deposit', amount, reference: `dep:${reference}`, transactionCode: claimed.transactionCode, note: 'Kazi Yetu M-Pesa deposit confirmed' }], { session });
+      await User.updateOne({ _id: claimed.userId, portalId: PORTAL_ID }, { $inc: { unlockPoints: amount / 2 } }, { session });
+      await Entry.create([{ userId: claimed.userId, type: 'deposit', amount, reference: `dep:${reference}`, transactionCode: claimed.transactionCode, note: `Deposit confirmed · ${(amount/2).toLocaleString()} level points added` }], { session });
     });
   } catch(e) { if(e.status===400)return res.status(400).send(e.message); throw e; }
   finally { await session.endSession(); }
