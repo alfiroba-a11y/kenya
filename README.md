@@ -1,6 +1,6 @@
 # Kazi Kenya
 
-Kazi Kenya is a Kenya-focused online-work skills hub with 19 workspaces. Each has six job-focused levels of 10 questions. Question order and answer choices are randomized. Every level is locked until confirmed deposits total KES 650 and at least KES 650 is currently available; progress is saved per account in MongoDB. Quiz scores add skill points. Admins verify eligible points as pending work earnings, then separately confirm them as available in the wallet (1 point = KES 1). Withdrawals unlock automatically at KES 1,250 available.
+Kazi Kenya is a Kenya-focused online-work skills hub with 19 workspaces. Each has six job-focused levels of 10 questions. Question order and answer choices are randomized. Every level is locked until confirmed deposits total KES 650 and at least KES 650 is currently available; progress is saved per account in MongoDB. Quiz scores add skill points. Approved points enter pending work earnings at 1 point = KES 1; a separate confirmation adds them to the wallet. Withdrawals require at least KES 1,250 marked ready.
 
 ## Deploy on Render
 1. Push this folder to GitHub and create a Render **Web Service** from the repository. Runtime: Node. Build command: `npm install`; start command: `npm start`.
@@ -9,14 +9,14 @@ Kazi Kenya is a Kenya-focused online-work skills hub with 19 workspaces. Each ha
 4. The app has a fallback `ADMIN_PATH`. Set a private route in Render if you want a different one. The admin portal always requires login.
 5. Configure `PAYMENT_ACCOUNT_ID`, `PAYMENT_API_KEY`, `PAYMENT_WEBHOOK_SECRET`, and `PAYMENT_SECURITY_CREDENTIAL` in Render. Set the payment service callback to `https://YOUR-RENDER-HOST/api/payments/callback`.
 
-MongoDB Atlas is used because Render's free web service does not bundle a persistent database. The application requires a valid MongoDB connection.
+MongoDB Atlas is used because Render's free web service does not bundle a persistent database. The application requires a valid MongoDB connection. Member accounts are stored in the portal-specific `kazi_kenya_users` collection, so other sites can use the same cluster without sharing this portal’s registrations. Existing accounts with Kazi-specific transaction records are copied from the legacy `users` collection at startup.
 
 ## Wallet and transaction codes
 - Deposits start an M-Pesa prompt to the phone number entered in the Kazi Kenya wallet. A signed payment callback confirms the amount, phone, account, and reference before crediting the wallet. An administrator can also confirm a deposit after verifying it arrived.
-- Withdrawals are KES 1,250–12,000 and require at least KES 1,250 available. Admins can send a withdrawal or reconcile an uncertain request. The portal does not ask an admin to enter a payment receipt or payout code.
+- Withdrawals are KES 1,250–12,000 and cannot exceed the member’s amount marked ready. Requests show as processing; the administrator records the completed payout or releases a failed request. The portal does not ask an admin to enter a payment receipt or payout code.
 - Each transaction receives a globally reserved unique code such as `KYT-20261001-...`. Its code remains the same when a pending deposit or withdrawal is completed and is shown in member transaction history.
 - Admin wallet actions are only deposit or withdraw. They update the balance and create a matching transaction-history entry with the admin's reason.
-- Quizzes save learning progress but do not award or deduct cash. Earnings in the wallet come from confirmed deposits, admin-recorded deposit/withdraw transactions, or verified client-paid work.
+- Quiz points are tracked separately until approved into pending work earnings and confirmed as available. Deposits and confirmed work earnings appear in available now; the wallet total also includes funds reserved for a processing withdrawal.
 
 ## API overview
 - `POST /api/auth/register`, `POST /api/auth/login`
