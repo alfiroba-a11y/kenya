@@ -19,6 +19,7 @@
 .financial-overview .progress-track{margin-top:auto}
 .footer-admin{background:transparent;color:#718174;font-size:8px;padding:0}
 .admin-panel{width:min(100%,880px)}
+.admin-refresh-row{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-top:18px;padding:12px 14px;border:1px solid #e4e9e1;border-radius:10px;background:#f7f9f4;color:#405a47;font-weight:700}
 .admin-section{margin-top:22px}
 .admin-section h4{font:700 14px var(--display);margin:0 0 10px;color:#234b36}
 .admin-deposit{padding:14px;margin:9px 0;border:1px solid #e2e8dc;border-radius:8px;background:#fff;display:grid;grid-template-columns:1fr 1.2fr auto;align-items:end;gap:12px}
