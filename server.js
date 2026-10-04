@@ -208,22 +208,38 @@ app.get('/api/workspaces/progress', auth, async (req, res) => {
 });
 const LEVEL_UNLOCK_COST = 30;
 function levelIsUnlocked(progress, level) { const row=progress?.levels?.find(item=>item.level===level); return !!(row?.unlocked || row?.completed); }
+async function openPaidLevel(payment){
+  const fresh=await LevelUnlockPayment.findById(payment._id).lean();if(!fresh||fresh.status!=='paid')return false;
+  let progress=await Progress.findOne({userId:fresh.userId,workspace:fresh.workspace});if(!progress)progress=new Progress({userId:fresh.userId,workspace:fresh.workspace,levels:[]});
+  let row=progress.levels.find(item=>item.level===fresh.level);if(row){row.unlocked=true;row.unlockCost=30;row.unlockedAt=row.unlockedAt||new Date()}else progress.levels.push({level:fresh.level,unlocked:true,unlockCost:30,unlockedAt:new Date(),completed:false,score:0,points:0});progress.updatedAt=new Date();await progress.save();return true;
+}
+async function markUnlockPaid(payment){
+  const claimed=await LevelUnlockPayment.findOneAndUpdate({_id:payment._id,status:{$in:['pending','failed']}},{$set:{status:'paid',checkoutId:String(payment.checkoutId||'')}},{new:true});
+  if(claimed)return openPaidLevel(claimed);return openPaidLevel(payment);
+}
 app.post('/api/workspaces/:slug/levels/:level/unlock-payment', auth, async (req,res) => {
-  const level=Number(req.params.level), slug=req.params.slug, phone=normalizePhone(req.body?.phone);
+  const level=Number(req.params.level),slug=req.params.slug,phone=normalizePhone(req.body?.phone);
   if(!WORKSPACES.some(w=>w.slug===slug)||!Number.isInteger(level)||level<1||level>6)return res.status(404).json({error:'Workspace or level not found.'});
   if(!phoneOk(phone))return res.status(400).json({error:'Enter a valid Kenyan M-Pesa number.'});
-  const progress=await Progress.findOne({userId:req.user.id,workspace:slug}).select('levels').lean();
-  if(levelIsUnlocked(progress,level))return res.json({unlocked:true,alreadyUnlocked:true});
+  const progress=await Progress.findOne({userId:req.user.id,workspace:slug}).select('levels').lean();if(levelIsUnlocked(progress,level))return res.json({unlocked:true,alreadyUnlocked:true});
   if(!paymentAccountId()||!paymentApiKey()||!paymentWebhookSecret())return res.status(503).json({error:'M-Pesa level unlocks are temporarily unavailable. Please try again later.'});
-  const reference='KKU-'+crypto.randomUUID(), transactionCode=await reserveTransactionCode();
-  const order=await LevelUnlockPayment.create({userId:req.user.id,workspace:slug,level,reference,transactionCode,amount:30,phone});
+  const prior=await LevelUnlockPayment.findOne({userId:req.user.id,workspace:slug,level,status:'pending'}).sort({createdAt:-1});if(prior){const age=Date.now()-new Date(prior.createdAt).getTime();if(age<5*60*1000)return res.status(202).json({reference:prior.reference,transactionCode:prior.transactionCode,checkoutId:prior.checkoutId,status:'pending',promptAccepted:!!prior.checkoutId,message:prior.checkoutId?'An M-Pesa request is already active for this level. Check your phone before trying again.':'We could not confirm whether the earlier request reached your phone. Check your phone before trying again.'});await LevelUnlockPayment.updateOne({_id:prior._id,status:'pending'},{$set:{status:'failed'}})}
+  const reference='KKU-'+crypto.randomUUID(),transactionCode=await reserveTransactionCode(),order=await LevelUnlockPayment.create({userId:req.user.id,workspace:slug,level,reference,transactionCode,amount:30,phone});
   let response,result;
-  try{response=await fetch('https://api.hashback.co.ke/initiatestk',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({api_key:paymentApiKey(),account_id:paymentAccountId(),amount:'30',msisdn:phone,reference}),signal:AbortSignal.timeout(20000)});result=await response.json()}catch{return res.status(202).json({reference,transactionCode,status:'pending',message:'M-Pesa prompt status is not confirmed yet. Check your phone before requesting another prompt.'})}
-  if(!response.ok||result.success!==true||!result.checkout_id){await LevelUnlockPayment.updateOne({_id:order._id,status:'pending'},{$set:{status:'failed'}});return res.status(502).json({error:'The KES 30 M-Pesa prompt could not be sent.'})}
-  await LevelUnlockPayment.updateOne({_id:order._id,status:'pending'},{$set:{checkoutId:String(result.checkout_id)}});
-  res.status(202).json({reference,transactionCode,status:'pending',message:'KES 30 M-Pesa prompt sent. Enter your PIN; this level opens after payment confirmation.'});
+  try{response=await fetch('https://api.hashback.co.ke/initiatestk',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({api_key:paymentApiKey(),account_id:paymentAccountId(),amount:'30',msisdn:phone,reference}),signal:AbortSignal.timeout(20000)});result=await response.json().catch(()=>({}));}
+  catch(error){console.error('M-Pesa prompt request could not be confirmed:',error.name,error.message);return res.status(202).json({reference,transactionCode,status:'pending',promptAccepted:false,message:'We could not confirm whether the prompt request was accepted. Check your phone before trying again.'})}
+  const accepted=response.ok&&result.success===true&&!!(result.checkout_id||result.CheckoutRequestID)&&(!('ResponseCode'in result)||String(result.ResponseCode)==='0');
+  if(!accepted){await LevelUnlockPayment.updateOne({_id:order._id,status:'pending'},{$set:{status:'failed'}});const providerMessage=String(result.CustomerMessage||result.message||result.error?.message||'').trim().slice(0,180);return res.status(502).json({error:providerMessage||'The payment request was not accepted. Check the phone number and try again.'})}
+  const checkoutId=String(result.checkout_id||result.CheckoutRequestID);await LevelUnlockPayment.updateOne({_id:order._id,status:'pending'},{$set:{checkoutId}});
+  res.status(202).json({reference,transactionCode,checkoutId,status:'pending',promptAccepted:true,message:String(result.CustomerMessage||'Payment request accepted. Check your M-Pesa phone and enter your PIN to continue.').slice(0,180)});
 });
-app.get('/api/levels/unlock-payments/:reference',auth,async(req,res)=>{const item=await LevelUnlockPayment.findOne({reference:req.params.reference,userId:req.user.id}).select('reference workspace level amount status transactionCode createdAt').lean();if(!item)return res.status(404).json({error:'Level unlock payment not found.'});res.json(item)});
+app.get('/api/levels/unlock-payments/:reference',auth,async(req,res)=>{
+ const item=await LevelUnlockPayment.findOne({reference:req.params.reference,userId:req.user.id});if(!item)return res.status(404).json({error:'Level unlock payment not found.'});
+ if(item.status==='pending'&&item.checkoutId&&paymentApiKey()&&paymentAccountId()){
+   try{const response=await fetch('https://api.hashback.co.ke/transactionstatus',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({api_key:paymentApiKey(),account_id:paymentAccountId(),checkoutid:item.checkoutId}),signal:AbortSignal.timeout(10000)});const status=await response.json().catch(()=>({}));if(response.ok&&String(status.ResponseCode)==='0'&&status.ResultCode!==undefined&&status.ResultCode!==null){if(String(status.ResultCode)==='0')await markUnlockPaid(item);else await LevelUnlockPayment.updateOne({_id:item._id,status:'pending'},{$set:{status:'failed'}})}}catch(error){console.warn('Payment status check is temporarily unavailable:',error.name)}
+ }
+ const current=await LevelUnlockPayment.findById(item._id).select('reference workspace level amount status transactionCode createdAt').lean();res.json({...current,promptAccepted:!!item.checkoutId,message:item.status==='paid'?'Payment confirmed.':item.status==='failed'?'Payment was not completed.':'Payment status is still pending.'});
+});
 app.get('/api/workspaces/:slug/levels/:level/questions', auth, async (req, res) => {
   const level = Number(req.params.level), questions = getQuestions(req.params.slug, level);
   if (!questions || !Number.isInteger(level) || level < 1 || level > 6) return res.status(404).json({ error: 'Workspace or level not found.' });
@@ -384,7 +400,7 @@ app.get('/api/payments/deposits/:reference', auth, async (req,res) => {
 // Verify signed callback bytes and the payment reference before crediting a wallet.
 app.post('/api/payments/callback', express.raw({ type: 'application/json', limit: '32kb' }), async (req, res) => {
   const secret = paymentWebhookSecret();
-  const signature = req.get(['x','hash','pay','signature'].join('-')) || '';
+  const signature = req.get('X-Hashpay-Signature') || req.get('X-Hash-Pay-Signature') || '';
   const expected = `sha256=${crypto.createHmac('sha256', secret).update(req.body).digest('hex')}`;
   const a = Buffer.from(signature), b = Buffer.from(expected);
   if (!secret || a.length !== b.length || !crypto.timingSafeEqual(a, b)) return res.status(401).send('Invalid signature');
@@ -398,8 +414,7 @@ app.post('/api/payments/callback', express.raw({ type: 'application/json', limit
     if(event.event!=='payment.success'||Number(event.ResponseCode)!==0){if(unlockPayment.status==='pending')await LevelUnlockPayment.updateOne({_id:unlockPayment._id,status:'pending'},{$set:{status:'failed'}});return res.sendStatus(200)}
     if(!Number.isSafeInteger(Number(event.TransactionAmount))||Number(event.TransactionAmount)!==30||!event.TransactionID)return res.status(400).send('Invalid payment amount or transaction ID');
     if(event.Msisdn&&normalizePhone(event.Msisdn)!==normalizePhone(unlockPayment.phone))return res.status(400).send('Phone mismatch');
-    if(unlockPayment.status==='pending')await LevelUnlockPayment.updateOne({_id:unlockPayment._id,status:'pending'},{$set:{status:'paid',checkoutId:String(event.CheckoutRequestID||unlockPayment.checkoutId||'')}});
-    let progress=await Progress.findOne({userId:unlockPayment.userId,workspace:unlockPayment.workspace});if(!progress)progress=new Progress({userId:unlockPayment.userId,workspace:unlockPayment.workspace,levels:[]});let row=progress.levels.find(item=>item.level===unlockPayment.level);if(row){row.unlocked=true;row.unlockCost=30;row.unlockedAt=row.unlockedAt||new Date()}else progress.levels.push({level:unlockPayment.level,unlocked:true,unlockCost:30,unlockedAt:new Date(),completed:false,score:0,points:0});progress.updatedAt=new Date();await progress.save();return res.sendStatus(200)
+    unlockPayment.checkoutId=String(event.CheckoutRequestID||unlockPayment.checkoutId||'');await markUnlockPaid(unlockPayment);return res.sendStatus(200)
   }
   if(event.event!=='payment.success'||Number(event.ResponseCode)!==0)return res.sendStatus(200);
   const amount=Number(event.TransactionAmount);if(!Number.isSafeInteger(amount)||!event.TransactionID)return res.status(400).send('Invalid payment amount or transaction ID');
