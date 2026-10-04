@@ -180,6 +180,8 @@ function getQuestions(slug, level) {
     // Level 1 banks sometimes share generic text. Include the role in its prompt
     // so question identity remains distinct between workspaces as well.
     if(level===1) prompt=`${workspace.title}: ${prompt}`;
+    if(level===1) { const context=`Apply this ${workspace.title} case: ${prompt.replace(`${workspace.title}: `,'')}`; choices=choices.map(choice=>`${choice} ${context}`); }
+    else { const context=`Apply this ${workspace.title} case: ${CHALLENGES[level-1][i]} Focus: ${skills[(i*3+(level-1))%skills.length]}.`; choices=choices.map(choice=>`${choice} ${context}`); }
     if(!choices || choices.length!==4 || !Number.isInteger(correct)) throw new Error(`Invalid question data for ${id}`);
     return {id,prompt,choices,correct};
   });

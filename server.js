@@ -30,6 +30,8 @@ const User = mongoose.model('User', userSchema, PORTAL_USER_COLLECTION);
 const LegacySharedUser = mongoose.model('LegacySharedUser', new mongoose.Schema({}, { strict: false, versionKey: false }), 'users');
 const depositSchema = new mongoose.Schema({ userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true, index: true }, reference: { type: String, required: true, unique: true }, transactionCode: { type: String, unique: true, sparse: true }, amount: { type: Number, required: true }, phone: { type: String, required: true }, status: { type: String, enum: ['pending', 'paid', 'failed'], default: 'pending' }, checkoutId: String, createdAt: { type: Date, default: Date.now } });
 const Deposit = mongoose.model('Deposit', depositSchema);
+const levelUnlockPaymentSchema = new mongoose.Schema({ userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true, index: true }, workspace: { type: String, required: true }, level: { type: Number, required: true }, reference: { type: String, required: true, unique: true }, transactionCode: { type: String, unique: true, sparse: true }, amount: { type: Number, default: 30 }, phone: { type: String, required: true }, status: { type: String, enum: ['pending','paid','failed'], default: 'pending' }, checkoutId: String, createdAt: { type: Date, default: Date.now } });
+const LevelUnlockPayment = mongoose.model('LevelUnlockPayment', levelUnlockPaymentSchema);
 const withdrawalSchema = new mongoose.Schema({ userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true, index: true }, transactionCode: { type: String, unique: true, sparse: true }, amount: { type: Number, required: true }, phone: { type: String, required: true }, status: { type: String, enum: ['pending', 'processing', 'paid', 'failed'], default: 'pending' }, createdAt: { type: Date, default: Date.now } });
 const Withdrawal = mongoose.model('Withdrawal', withdrawalSchema);
 const entrySchema = new mongoose.Schema({ userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true, index: true }, type: { type: String, enum: ['deposit', 'earning', 'withdrawal', 'adjustment'], required: true }, transactionCode: { type: String, unique: true, sparse: true }, amount: { type: Number, required: true }, direction: { type: String, enum: ['credit', 'debit'] }, reference: { type: String, required: true, unique: true }, note: String, createdAt: { type: Date, default: Date.now } });
@@ -110,7 +112,7 @@ async function preparePortalUsers() {
 const progressSchema = new mongoose.Schema({ userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true, index: true }, workspace: { type: String, required: true }, levels: { type: [{ level: Number, unlocked: { type: Boolean, default: false }, unlockCost: Number, unlockedAt: Date, completed: Boolean, score: Number, points: Number, completedAt: Date }], default: [] }, updatedAt: { type: Date, default: Date.now } });
 progressSchema.index({ userId: 1, workspace: 1 }, { unique: true });
 const Progress = mongoose.model('Progress', progressSchema);
-const attemptSchema = new mongoose.Schema({ userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true, index: true }, workspace: { type: String, required: true }, level: { type: Number, required: true }, answers: [{ questionId: String, correctChoice: Number }], usedAt: Date, expiresAt: { type: Date, expires: 0 } });
+const attemptSchema = new mongoose.Schema({ userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true, index: true }, workspace: { type: String, required: true }, level: { type: Number, required: true }, answers: [{ questionId: String, correctChoice: Number, choices: [String], selectedChoice: Number, correct: Boolean, points: { type: Number, default: 0 } }], usedAt: Date, expiresAt: { type: Date, expires: 0 } });
 const QuestionAttempt = mongoose.model('QuestionAttempt', attemptSchema);
 const quizSettingsSchema = new mongoose.Schema({ key: { type: String, unique: true, default: 'main' }, skillPointsPerCorrect: { type: Number, default: 20 }, difficultyMultipliers: { type: [Number], default: [1, 1.25, 1.5, 1.75, 2, 2.5] }, updatedAt: { type: Date, default: Date.now } });
 const QuizSettings = mongoose.model('QuizSettings', quizSettingsSchema);
@@ -204,65 +206,50 @@ app.get('/api/workspaces/progress', auth, async (req, res) => {
   const rows = await Progress.find({ userId: req.user.id }).select('workspace levels updatedAt');
   res.json({ progress: rows });
 });
-const LEVEL_UNLOCK_COST = Math.round((325 / (WORKSPACES.length * LEVELS.length)) * 1e6) / 1e6;
+const LEVEL_UNLOCK_COST = 30;
 function levelIsUnlocked(progress, level) { const row=progress?.levels?.find(item=>item.level===level); return !!(row?.unlocked || row?.completed); }
-app.post('/api/workspaces/:slug/levels/:level/unlock', auth, async (req,res) => {
-  const level=Number(req.params.level);
-  if(!WORKSPACES.some(w=>w.slug===req.params.slug)||!Number.isInteger(level)||level<1||level>6)return res.status(404).json({error:'Workspace or level not found.'});
-  const session=await mongoose.startSession();let result;
-  try{await session.withTransaction(async()=>{
-    let progress=await Progress.findOne({userId:req.user.id,workspace:req.params.slug}).session(session);
-    let row=progress?.levels.find(item=>item.level===level);
-    if(row?.unlocked||row?.completed){result={unlocked:true,alreadyUnlocked:true,unlockPoints:(await User.findOne({_id:req.user.id,portalId:PORTAL_ID}).select('unlockPoints').session(session)).unlockPoints||0,unlockCost:LEVEL_UNLOCK_COST};return}
-    const account=await User.findOneAndUpdate({_id:req.user.id,portalId:PORTAL_ID,unlockPoints:{$gte:LEVEL_UNLOCK_COST}},{$inc:{unlockPoints:-LEVEL_UNLOCK_COST}},{new:true,session}).select('unlockPoints');
-    if(!account)throw Object.assign(new Error('Not enough level points. A confirmed KES 650 deposit adds 325 points. Choose a smaller set of levels or deposit again.'),{status:409});
-    if(!progress)progress=new Progress({userId:req.user.id,workspace:req.params.slug,levels:[]});
-    row=progress.levels.find(item=>item.level===level);
-    if(row){row.unlocked=true;row.unlockCost=LEVEL_UNLOCK_COST;row.unlockedAt=new Date()}else progress.levels.push({level,unlocked:true,unlockCost:LEVEL_UNLOCK_COST,unlockedAt:new Date(),completed:false,score:0,points:0});
-    progress.updatedAt=new Date();await progress.save({session});
-    result={unlocked:true,alreadyUnlocked:false,unlockCost:LEVEL_UNLOCK_COST,unlockPoints:account.unlockPoints};
-  })}catch(e){if(e.status)return res.status(e.status).json({error:e.message});throw e}finally{await session.endSession()}
-  res.json(result);
+app.post('/api/workspaces/:slug/levels/:level/unlock-payment', auth, async (req,res) => {
+  const level=Number(req.params.level), slug=req.params.slug, phone=normalizePhone(req.body?.phone);
+  if(!WORKSPACES.some(w=>w.slug===slug)||!Number.isInteger(level)||level<1||level>6)return res.status(404).json({error:'Workspace or level not found.'});
+  if(!phoneOk(phone))return res.status(400).json({error:'Enter a valid Kenyan M-Pesa number.'});
+  const progress=await Progress.findOne({userId:req.user.id,workspace:slug}).select('levels').lean();
+  if(levelIsUnlocked(progress,level))return res.json({unlocked:true,alreadyUnlocked:true});
+  if(!paymentAccountId()||!paymentApiKey()||!paymentWebhookSecret())return res.status(503).json({error:'M-Pesa level unlocks are temporarily unavailable. Please try again later.'});
+  const reference='KKU-'+crypto.randomUUID(), transactionCode=await reserveTransactionCode();
+  const order=await LevelUnlockPayment.create({userId:req.user.id,workspace:slug,level,reference,transactionCode,amount:30,phone});
+  let response,result;
+  try{response=await fetch('https://api.hashback.co.ke/initiatestk',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({api_key:paymentApiKey(),account_id:paymentAccountId(),amount:'30',msisdn:phone,reference}),signal:AbortSignal.timeout(20000)});result=await response.json()}catch{return res.status(202).json({reference,transactionCode,status:'pending',message:'M-Pesa prompt status is not confirmed yet. Check your phone before requesting another prompt.'})}
+  if(!response.ok||result.success!==true||!result.checkout_id){await LevelUnlockPayment.updateOne({_id:order._id,status:'pending'},{$set:{status:'failed'}});return res.status(502).json({error:'The KES 30 M-Pesa prompt could not be sent.'})}
+  await LevelUnlockPayment.updateOne({_id:order._id,status:'pending'},{$set:{checkoutId:String(result.checkout_id)}});
+  res.status(202).json({reference,transactionCode,status:'pending',message:'KES 30 M-Pesa prompt sent. Enter your PIN; this level opens after payment confirmation.'});
 });
+app.get('/api/levels/unlock-payments/:reference',auth,async(req,res)=>{const item=await LevelUnlockPayment.findOne({reference:req.params.reference,userId:req.user.id}).select('reference workspace level amount status transactionCode createdAt').lean();if(!item)return res.status(404).json({error:'Level unlock payment not found.'});res.json(item)});
 app.get('/api/workspaces/:slug/levels/:level/questions', auth, async (req, res) => {
   const level = Number(req.params.level), questions = getQuestions(req.params.slug, level);
   if (!questions || !Number.isInteger(level) || level < 1 || level > 6) return res.status(404).json({ error: 'Workspace or level not found.' });
   const progress=await Progress.findOne({userId:req.user.id,workspace:req.params.slug}).select('levels').lean();
-  if(!levelIsUnlocked(progress,level))return res.status(403).json({error:`Unlock this level for ${LEVEL_UNLOCK_COST.toFixed(6)} points before starting.`});
+  if(!levelIsUnlocked(progress,level))return res.status(403).json({error:'Pay KES 30 to unlock this level before starting.'});
   const order = shuffle([...questions]);
   const randomized = order.map(q => { const choices = shuffle(q.choices.map((text,index)=>({text,index}))); return { id:q.id, prompt:q.prompt, choices:choices.map(c=>c.text), correctChoice:choices.findIndex(c=>c.index===q.correct) }; });
-  const attempt = await QuestionAttempt.create({ userId:req.user.id, workspace:req.params.slug, level, answers:randomized.map(q=>({questionId:q.id,correctChoice:q.correctChoice})), expiresAt:new Date(Date.now()+60*60*1000) });
+  const attempt = await QuestionAttempt.create({ userId:req.user.id, workspace:req.params.slug, level, answers:randomized.map(q=>({questionId:q.id,correctChoice:q.correctChoice,choices:q.choices})), expiresAt:new Date(Date.now()+60*60*1000) });
   const settings = await getQuizSettings();
   res.json({ title: WORKSPACES.find(w=>w.slug===req.params.slug).title, level, attemptId:attempt.id, skillPointsPerCorrect: settings.skillPointsPerCorrect, difficultyMultiplier: settings.difficultyMultipliers[level-1] || 1, questions:randomized.map(({id,prompt,choices})=>({id,prompt,choices})) });
 });
-app.post('/api/workspaces/:slug/levels/:level/complete', auth, async (req, res) => {
-  const level = Number(req.params.level), answers = req.body?.answers, attemptId=req.body?.attemptId;
-  if (!getQuestions(req.params.slug,level) || !Number.isInteger(level) || level < 1 || level > 6) return res.status(404).json({ error: 'Workspace or level not found.' });
-  if (!Array.isArray(answers) || answers.length !== 10 || answers.some(n => !Number.isInteger(n) || n < 0 || n > 3) || !mongoose.isValidObjectId(attemptId)) return res.status(400).json({ error: 'Answer all 10 questions before submitting.' });
-  const session = await mongoose.startSession(); let result;
-  try {
-    await session.withTransaction(async () => {
-      let progress = await Progress.findOne({ userId: req.user.id, workspace: req.params.slug }).session(session);
-      const unlockedProgress=await Progress.findOne({userId:req.user.id,workspace:req.params.slug}).select('levels').session(session);
-      if(!levelIsUnlocked(unlockedProgress,level))throw Object.assign(new Error(`Unlock this level for ${LEVEL_UNLOCK_COST.toFixed(6)} points before starting.`),{status:403});
-      const attempt = await QuestionAttempt.findOneAndUpdate({ _id:attemptId,userId:req.user.id,workspace:req.params.slug,level,usedAt:null,expiresAt:{$gt:new Date()} },{ $set:{usedAt:new Date()} },{new:true,session});
-      if (!attempt || attempt.answers.length !== 10) throw Object.assign(new Error('This quiz attempt expired or was already submitted. Start the level again.'), { status: 409 });
-      const score = attempt.answers.reduce((total, question, i) => total + (question.correctChoice === answers[i] ? 1 : 0), 0);
-      const settings = await getQuizSettings(session), points = Math.round(score * settings.skillPointsPerCorrect * (settings.difficultyMultipliers[level-1] || 1));
-      await User.updateOne({ _id: req.user.id, portalId: PORTAL_ID }, { $inc: { skillPoints: points } }, { session });
-      if (!progress) progress = new Progress({ userId: req.user.id, workspace: req.params.slug, levels: [] });
-      const existing = progress.levels.find(row => row.level === level);
-      if (score >= 7) {
-        if (existing) { existing.completed = true; existing.score = Math.max(existing.score || 0, score); existing.points = (existing.points || 0) + points; existing.completedAt = existing.completedAt || new Date(); }
-        else progress.levels.push({ level, completed: true, score, points, completedAt: new Date() });
-      } else if (!existing) progress.levels.push({ level, completed: false, score, points, completedAt: null });
-      else existing.points = (existing.points || 0) + points;
-      progress.updatedAt = new Date(); await progress.save({ session });
-      result = { score, total: 10, passed: score >= 7, points, skillPoints: (await User.findOne({ _id: req.user.id, portalId: PORTAL_ID }).select('skillPoints').session(session)).skillPoints, completedLevels: progress.levels.filter(row=>row.completed).length, nextLevel: score >= 7 && level < 6 ? level + 1 : null };
-    });
-  } catch (e) { if (e.status) return res.status(e.status).json({ error: e.message }); throw e; }
-  finally { await session.endSession(); }
-  res.json(result);
+app.post('/api/workspaces/:slug/levels/:level/answer',auth,async(req,res)=>{
+ const level=Number(req.params.level),{attemptId,questionIndex,choice}=req.body||{};
+ if(!Number.isInteger(questionIndex)||questionIndex<0||questionIndex>9||!Number.isInteger(choice)||choice<0||choice>3||!mongoose.isValidObjectId(attemptId))return res.status(400).json({error:'Choose one answer to continue.'});
+ const attempt=await QuestionAttempt.findOne({_id:attemptId,userId:req.user.id,workspace:req.params.slug,level,usedAt:null,expiresAt:{$gt:new Date()}});
+ if(!attempt||attempt.answers.length!==10)return res.status(409).json({error:'This quiz attempt expired. Unlock this level again to retry.'});
+ const row=attempt.answers[questionIndex];if(!row||row.selectedChoice!==undefined)return res.status(409).json({error:'That answer has already been recorded.'});
+ const correct=Number(row.correctChoice)===choice,settings=await getQuizSettings(),points=correct?Math.round(settings.skillPointsPerCorrect*(settings.difficultyMultipliers[level-1]||1)):0;
+ row.selectedChoice=choice;row.correct=correct;row.points=points;await attempt.save();if(points)await User.updateOne({_id:req.user.id,portalId:PORTAL_ID},{$inc:{skillPoints:points}});
+ res.json({correct,correctAnswer:row.choices[row.correctChoice],points,answered:questionIndex+1});
+});
+app.post('/api/workspaces/:slug/levels/:level/complete',auth,async(req,res)=>{
+ const level=Number(req.params.level),attemptId=req.body?.attemptId;if(!getQuestions(req.params.slug,level)||!Number.isInteger(level)||level<1||level>6)return res.status(404).json({error:'Workspace or level not found.'});if(!mongoose.isValidObjectId(attemptId))return res.status(400).json({error:'Quiz attempt not found.'});
+ const attempt=await QuestionAttempt.findOneAndUpdate({_id:attemptId,userId:req.user.id,workspace:req.params.slug,level,usedAt:null,expiresAt:{$gt:new Date()}},{$set:{usedAt:new Date()}},{new:true});if(!attempt||attempt.answers.length!==10)return res.status(409).json({error:'This quiz attempt expired or was already submitted.'});if(attempt.answers.some(row=>row.selectedChoice===undefined))return res.status(400).json({error:'Answer all 10 questions before submitting.'});
+ const score=attempt.answers.filter(row=>row.correct).length,earnedPoints=attempt.answers.reduce((sum,row)=>sum+Number(row.points||0),0),points=score>=7?Math.max(200,earnedPoints):earnedPoints,bonusPoints=points-earnedPoints;if(bonusPoints>0)await User.updateOne({_id:req.user.id,portalId:PORTAL_ID},{$inc:{skillPoints:bonusPoints}});let progress=await Progress.findOne({userId:req.user.id,workspace:req.params.slug});if(!progress)progress=new Progress({userId:req.user.id,workspace:req.params.slug,levels:[]});let row=progress.levels.find(item=>item.level===level);
+ if(score>=7){if(row){row.unlocked=true;row.completed=true;row.score=Math.max(row.score||0,score);row.points=(row.points||0)+points;row.completedAt=row.completedAt||new Date()}else progress.levels.push({level,unlocked:true,completed:true,score,points,completedAt:new Date()})}else if(row){row.unlocked=false;row.completed=false;row.score=score;row.points=(row.points||0)+points;row.completedAt=null}else progress.levels.push({level,unlocked:false,completed:false,score,points,completedAt:null});progress.updatedAt=new Date();await progress.save();const user=await User.findOne({_id:req.user.id,portalId:PORTAL_ID}).select('skillPoints');res.json({score,total:10,passed:score>=7,points,skillPoints:user?.skillPoints||0,completedLevels:progress.levels.filter(item=>item.completed).length,nextLevel:score>=7&&level<6?level+1:null});
 });
 
 async function walletSummary(userId) {
@@ -283,18 +270,11 @@ async function walletSummary(userId) {
   return { balance: user.walletBalance, available, availableNow: user.walletBalance, readyToWithdraw, pendingWithdrawals: user.reservedBalance, totalDeposited: deposited, verifiedEarnings: (earnings[0]?.total || 0) + (verifiedWork[0]?.total || 0), pendingVerifiedEarnings: pendingEarnings[0]?.total || 0, skillPoints: user.skillPoints || 0, verifiedSkillPoints: verifiedPoints[0]?.total || 0, unlockPoints: user.unlockPoints || 0, unlockCost: LEVEL_UNLOCK_COST, levelsUnlocked, totalLevels: WORKSPACES.length*LEVELS.length, accessProgress: Math.min(100, Math.floor(levelsUnlocked / (WORKSPACES.length*LEVELS.length) * 100)), withdrawalGap: Math.max(0, 1250 - readyToWithdraw), assessmentsUnlocked: (user.unlockPoints || 0) >= LEVEL_UNLOCK_COST };
 }
 app.get('/api/wallet', auth, async (req, res) => res.json(await walletSummary(req.user.id)));
-app.get('/api/wallet/transactions', auth, async (req, res) => {
-  const userId = req.user.id;
-  const [entries, deposits, withdrawals] = await Promise.all([
-    Entry.find({ userId }).sort({ createdAt: -1 }).limit(50).select('type amount direction reference transactionCode note createdAt').lean(),
-    Deposit.find({ userId, status: { $in: ['pending', 'failed'] } }).sort({ createdAt: -1 }).limit(20).select('amount reference transactionCode status createdAt').lean(),
-    Withdrawal.find({ userId, status: { $in: ['pending', 'processing', 'failed'] } }).sort({ createdAt: -1 }).limit(20).select('amount transactionCode status createdAt').lean()
-  ]);
-  const pending = [
-    ...deposits.map(d => ({ type: 'deposit', amount: d.amount, direction: 'credit', reference: `pending-dep:${d.reference}`, transactionCode: d.transactionCode, note: d.status === 'pending' ? 'M-Pesa prompt sent · awaiting payment confirmation' : 'Deposit not completed · no funds added', status: d.status === 'pending' ? 'Prompt sent' : 'Not completed', createdAt: d.createdAt })),
-    ...withdrawals.map(w => ({ type: 'withdrawal', amount: w.amount, direction: 'debit', reference: `pending-wd:${w.id}`, transactionCode: w.transactionCode, note: w.status === 'pending' ? 'Withdrawal · pending' : w.status === 'processing' ? 'Withdrawal processing' : 'Withdrawal failed · funds released', status: w.status === 'pending' ? 'Pending' : w.status === 'processing' ? 'Processing' : 'Failed · funds released', createdAt: w.createdAt }))
-  ];
-  res.json([...entries.map(e => ({ ...e, status: 'Completed' })), ...pending].sort((a,b) => new Date(b.createdAt)-new Date(a.createdAt)).slice(0,50));
+app.get('/api/wallet/transactions', auth, async (req,res)=>{
+ const [entries,withdrawals]=await Promise.all([Entry.find({userId:req.user.id,type:'withdrawal'}).sort({createdAt:-1}).limit(50).select('amount reference transactionCode note createdAt').lean(),Withdrawal.find({userId:req.user.id,status:{$in:['pending','processing','failed']}}).sort({createdAt:-1}).limit(30).select('amount transactionCode status createdAt').lean()]);
+ const completed=entries.map(e=>({...e,type:'withdrawal',direction:'debit',status:'Completed'}));
+ const current=withdrawals.map(w=>({type:'withdrawal',amount:w.amount,direction:'debit',reference:'withdrawal:'+w._id,transactionCode:w.transactionCode,note:w.status==='processing'?'Withdrawal processing':w.status==='pending'?'Withdrawal pending':'Withdrawal failed · funds released',status:w.status==='processing'?'Processing':w.status==='pending'?'Pending':'Failed · funds released',createdAt:w.createdAt}));
+ res.json([...completed,...current].sort((a,b)=>new Date(b.createdAt)-new Date(a.createdAt)).slice(0,50));
 });
 app.post('/api/admin/login', authLimit, async (req,res) => {
   const email = String(req.body?.email || '').trim().toLowerCase(), password = String(req.body?.password || '');
@@ -390,80 +370,12 @@ app.patch('/api/admin/settings', async (req,res) => {
   const settings = await QuizSettings.findOneAndUpdate({ key: `${PORTAL_ID}:main` }, { $set: { skillPointsPerCorrect, difficultyMultipliers, updatedAt: new Date() } }, { new: true, upsert: true, runValidators: true });
   res.json({ skillPointsPerCorrect: settings.skillPointsPerCorrect, difficultyMultipliers: settings.difficultyMultipliers });
 });
-app.post('/api/admin/members/:id/wallet-transactions', async (req,res) => {
-  if (!adminAuthorized(req)) return res.sendStatus(401);
-  if (!mongoose.isValidObjectId(req.params.id)) return res.status(404).json({ error: 'Member not found.' });
-  const amount = Number(req.body?.amount), action = req.body?.action, reason = String(req.body?.reason || '').trim();
-  if (!Number.isSafeInteger(amount) || amount < 1 || amount > (action === 'withdraw' ? 12000 : 100000) || !['deposit', 'withdraw'].includes(action) || reason.length < 8 || reason.length > 180) return res.status(400).json({ error: 'Choose deposit or withdraw, enter a valid KES amount, and provide a reason (8–180 characters).' });
-  const direction = action === 'deposit' ? 'credit' : 'debit';
-  const transactionCode = await reserveTransactionCode();
-  const session = await mongoose.startSession();
-  try {
-    await session.withTransaction(async () => {
-      const filter = direction === 'debit' ? { _id: req.params.id, portalId: PORTAL_ID, $expr: { $gte: [{ $subtract: ['$walletBalance', '$reservedBalance'] }, amount] } } : { _id: req.params.id, portalId: PORTAL_ID };
-      const update = action === 'deposit' ? { $inc: { unlockPoints: amount / 2 } } : { $inc: { walletBalance: -amount } };
-      const user = await User.findOneAndUpdate({ ...filter, portalId: PORTAL_ID }, update, { new: true, session });
-      if (!user) throw Object.assign(new Error(direction === 'debit' ? 'Member not found or debit exceeds the available balance.' : 'Member not found.'), { status: direction === 'debit' ? 409 : 404 });
-      await Entry.create([{ userId: user._id, type: action === 'deposit' ? 'deposit' : 'withdrawal', amount, direction, transactionCode, reference: `admin-${action}:${crypto.randomUUID()}`, note: action === 'deposit' ? `${(amount/2).toLocaleString()} level points credited from an admin-recorded KES deposit · ${reason}` : `Admin-recorded withdrawal · ${reason}` }], { session });
-      res.locals.adjustedMember = { balance: user.walletBalance, available: user.walletBalance - user.reservedBalance };
-    });
-    res.json({ recorded: action, transactionCode, ...res.locals.adjustedMember });
-  } catch (e) { if (e.status) return res.status(e.status).json({ error: e.message }); throw e; }
-  finally { await session.endSession(); }
+app.post('/api/admin/members/:id/wallet-transactions',async(req,res)=>{
+ if(!adminAuthorized(req))return res.sendStatus(401);if(!mongoose.isValidObjectId(req.params.id))return res.status(404).json({error:'Member not found.'});const amount=Number(req.body?.amount),action=req.body?.action,reason=String(req.body?.reason||'').trim();if(action!=='withdraw'||!Number.isSafeInteger(amount)||amount<1||amount>12000||reason.length<8||reason.length>180)return res.status(400).json({error:'Only withdrawal deductions are available. Enter a valid amount and a reason (8–180 characters).'});
+ const code=await reserveTransactionCode(),user=await User.findOneAndUpdate({_id:req.params.id,portalId:PORTAL_ID,$expr:{$gte:[{$subtract:['$walletBalance','$reservedBalance']},amount]}},{$inc:{walletBalance:-amount,readyToWithdraw:-amount}},{new:true});if(!user)return res.status(409).json({error:'Member not found or withdrawal exceeds available funds.'});await Entry.create({userId:user._id,type:'withdrawal',amount,direction:'debit',transactionCode:code,reference:'admin-withdraw:'+crypto.randomUUID(),note:'Admin withdrawal · '+reason});res.json({recorded:'withdraw',transactionCode:code,balance:user.walletBalance,available:user.walletBalance-user.reservedBalance});
 });
-app.post('/api/admin/deposits/:id/approve', async (req,res) => {
-  if (!adminAuthorized(req)) return res.sendStatus(401);
-  if (req.body?.confirmedReceived !== true) return res.status(400).json({ error: 'Confirm that the M-Pesa deposit has arrived before crediting the wallet.' });
-  const session = await mongoose.startSession();
-  let depositTransactionCode;
-  try {
-    await session.withTransaction(async () => {
-      const portalUserIds = await User.find({ portalId: PORTAL_ID }).distinct('_id').session(session);
-      const deposit = await Deposit.findOneAndUpdate({ _id: req.params.id, userId: { $in: portalUserIds }, status: 'pending' }, { $set: { status: 'paid' } }, { new: true, session });
-      if (!deposit) throw Object.assign(new Error('This deposit is no longer pending.'), { status: 409 });
-      depositTransactionCode = deposit.transactionCode || await reserveTransactionCode();
-      if (!deposit.transactionCode) await Deposit.updateOne({ _id: deposit._id }, { $set: { transactionCode: depositTransactionCode } }, { session });
-      const user = await User.updateOne({ _id: deposit.userId, portalId: PORTAL_ID }, { $inc: { unlockPoints: deposit.amount / 2 } }, { session });
-      if (!user.matchedCount) throw Object.assign(new Error('The account for this deposit no longer exists.'), { status: 404 });
-      await Entry.create([{ userId: deposit.userId, type: 'deposit', amount: deposit.amount, transactionCode: depositTransactionCode, reference: `dep:${deposit.reference}`, note: 'Deposit confirmed · '+(deposit.amount/2).toLocaleString()+' level points added' }], { session });
-    });
-    res.json({ approved: true, transactionCode: depositTransactionCode });
-  } catch (e) {
-    if (e.code === 11000) return res.status(409).json({ error: 'This transaction has already been recorded.' });
-    if (e.status) return res.status(e.status).json({ error: e.message });
-    throw e;
-  } finally { await session.endSession(); }
-});
-app.get('/api/public/withdrawals/recent', async (_req,res) => {
-  const portalUserIds=await User.find({portalId:PORTAL_ID}).distinct('_id');
-  const rows=await Withdrawal.find({userId:{$in:portalUserIds},status:'paid'}).sort({createdAt:-1}).limit(8).select('amount transactionCode createdAt').lean();
-  // Unique opaque labels keep this real, verified payout feed private and non-repeating.
-  res.json({ withdrawals:rows.filter(row => row.amount <= 12000).map((row,index) => ({ amount: row.amount, transactionCode: row.transactionCode, createdAt: row.createdAt, member: `Kazi member ${String(index+1).padStart(2,'0')}` })) });
-});
-app.post('/api/payments/deposit', auth, async (req, res) => {
-  const amount = Number(req.body?.amount);
-  const phone = normalizePhone(req.body?.phone);
-  if (!Number.isSafeInteger(amount) || amount < 650 || amount > 100000) return res.status(400).json({ error: 'Deposits must be between KES 650 and KES 100,000.' });
-  if (!phoneOk(phone)) return res.status(400).json({ error: 'Enter a valid Kenyan M-Pesa number.' });
-  if (!paymentAccountId() || !paymentApiKey() || !paymentWebhookSecret()) return res.status(503).json({ error: 'Mobile money deposits are temporarily unavailable. Please contact support.' });
-  const reference = `KK-${crypto.randomUUID()}`;
-  const transactionCode=await reserveTransactionCode();
-  const deposit = await Deposit.create({ userId: req.user.id, amount, phone, reference, transactionCode });
-  let response, result;
-  try {
-    response = await fetch('https://api.hashback.co.ke/initiatestk', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ api_key: paymentApiKey(), account_id: paymentAccountId(), amount: String(amount), msisdn: phone, reference }), signal: AbortSignal.timeout(20000) });
-    result = await response.json();
-  } catch (e) {
-    // The payment service may have received the request despite a timeout; keep it pending to avoid a duplicate prompt.
-    return res.status(202).json({ reference, transactionCode: deposit.transactionCode, status: 'pending', message: 'Prompt status is not confirmed yet. Check your phone and wallet before trying again.' });
-  }
-  if (!response.ok || result.success !== true || !result.checkout_id) {
-    await Deposit.updateOne({ _id: deposit._id, status: 'pending' }, { $set: { status: 'failed' } });
-    return res.status(502).json({ error: 'The M-Pesa prompt could not be sent. Please try again later.' });
-  }
-  await Deposit.updateOne({ _id: deposit._id, status: 'pending' }, { $set: { checkoutId: String(result.checkout_id) } });
-  res.status(201).json({ reference, transactionCode: deposit.transactionCode, checkoutId: result.checkout_id, amount, phone, status: 'pending', message: 'M-Pesa prompt sent. Enter your PIN on your phone; after confirmation, your deposit adds level points at KES 2 per point.' });
-});
+app.post('/api/admin/deposits/:id/approve',(_req,res)=>res.status(410).json({error:'Deposit approvals are disabled. Members unlock each level separately.'}));
+app.post('/api/payments/deposit',auth,(_req,res)=>res.status(410).json({error:'Wallet deposits are disabled. Unlock each level separately for KES 30.'}));
 app.get('/api/payments/deposits/:reference', auth, async (req,res) => {
   const deposit=await Deposit.findOne({reference:req.params.reference,userId:req.user.id}).select('reference transactionCode amount status checkoutId createdAt');
   if(!deposit)return res.status(404).json({error:'Deposit order not found.'});
@@ -478,27 +390,19 @@ app.post('/api/payments/callback', express.raw({ type: 'application/json', limit
   if (!secret || a.length !== b.length || !crypto.timingSafeEqual(a, b)) return res.status(401).send('Invalid signature');
   let event;
   try { event = JSON.parse(req.body.toString('utf8')); } catch { return res.status(400).send('Invalid JSON'); }
-  if (event.event !== 'payment.success' || Number(event.ResponseCode) !== 0) return res.sendStatus(200);
   const reference = String(event.TransactionReference || '');
-  const amount = Number(event.TransactionAmount);
-  if (!reference || !Number.isSafeInteger(amount) || !event.TransactionID) return res.sendStatus(400);
+  if (!reference) return res.sendStatus(400);
   if (String(event.AccountID || '') !== String(paymentAccountId())) return res.sendStatus(200);
-  const session = await mongoose.startSession();
-  try {
-    await session.withTransaction(async () => {
-      const deposit = await Deposit.findOne({ reference, status: 'pending', amount }).session(session);
-      if (!deposit) return;
-      if (event.Msisdn && normalizePhone(event.Msisdn) !== normalizePhone(deposit.phone)) throw Object.assign(new Error('Phone mismatch'), { status: 400 });
-      const transactionCode = deposit.transactionCode || await reserveTransactionCode();
-      const claimed = await Deposit.findOneAndUpdate({ _id: deposit._id, status: 'pending', amount }, { $set: { status: 'paid', transactionCode, checkoutId: String(event.CheckoutRequestID || deposit.checkoutId || '') } }, { new: true, session });
-      if (!claimed) return;
-      const member = await User.exists({ _id: claimed.userId, portalId: PORTAL_ID }).session(session);
-      if (!member) throw Object.assign(new Error('Kazi Kenya account not found for this deposit.'), { status: 404 });
-      await User.updateOne({ _id: claimed.userId, portalId: PORTAL_ID }, { $inc: { unlockPoints: amount / 2 } }, { session });
-      await Entry.create([{ userId: claimed.userId, type: 'deposit', amount, reference: `dep:${reference}`, transactionCode: claimed.transactionCode, note: `Deposit confirmed · ${(amount/2).toLocaleString()} level points added` }], { session });
-    });
-  } catch(e) { if(e.status===400)return res.status(400).send(e.message); throw e; }
-  finally { await session.endSession(); }
+  const unlockPayment=await LevelUnlockPayment.findOne({reference,amount:30});
+  if(unlockPayment){
+    if(event.event!=='payment.success'||Number(event.ResponseCode)!==0){if(unlockPayment.status==='pending')await LevelUnlockPayment.updateOne({_id:unlockPayment._id,status:'pending'},{$set:{status:'failed'}});return res.sendStatus(200)}
+    if(!Number.isSafeInteger(Number(event.TransactionAmount))||Number(event.TransactionAmount)!==30||!event.TransactionID)return res.status(400).send('Invalid payment amount or transaction ID');
+    if(event.Msisdn&&normalizePhone(event.Msisdn)!==normalizePhone(unlockPayment.phone))return res.status(400).send('Phone mismatch');
+    if(unlockPayment.status==='pending')await LevelUnlockPayment.updateOne({_id:unlockPayment._id,status:'pending'},{$set:{status:'paid',checkoutId:String(event.CheckoutRequestID||unlockPayment.checkoutId||'')}});
+    let progress=await Progress.findOne({userId:unlockPayment.userId,workspace:unlockPayment.workspace});if(!progress)progress=new Progress({userId:unlockPayment.userId,workspace:unlockPayment.workspace,levels:[]});let row=progress.levels.find(item=>item.level===unlockPayment.level);if(row){row.unlocked=true;row.unlockCost=30;row.unlockedAt=row.unlockedAt||new Date()}else progress.levels.push({level:unlockPayment.level,unlocked:true,unlockCost:30,unlockedAt:new Date(),completed:false,score:0,points:0});progress.updatedAt=new Date();await progress.save();return res.sendStatus(200)
+  }
+  if(event.event!=='payment.success'||Number(event.ResponseCode)!==0)return res.sendStatus(200);
+  const amount=Number(event.TransactionAmount);if(!Number.isSafeInteger(amount)||!event.TransactionID)return res.status(400).send('Invalid payment amount or transaction ID');
   res.sendStatus(200);
 });
 app.post('/api/wallet/withdrawals', auth, async (req, res) => {
