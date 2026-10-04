@@ -55,3 +55,5 @@ body.authenticated .public-facts{display:none}
 .topbar{border-bottom:0}
 .topbar::after{content:"";position:absolute;left:0;right:0;bottom:0;height:3px;background:linear-gradient(to right,var(--kenya-black) 0 32%,#fff 32% 34%,var(--kenya-red) 34% 66%,#fff 66% 68%,var(--kenya-green) 68% 100%);pointer-events:none}
 .brand-mark{background:var(--kenya-green);color:#fff}
+
+.answer-option.correct-answer{border-color:#66a653;background:#eef8e8;color:#264d31}.answer-option.wrong-answer{border-color:#d76b59;background:#fff0ed;color:#852f23}.answer-option:disabled{cursor:default}
